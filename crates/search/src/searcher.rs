@@ -1,10 +1,42 @@
 //! `Searcher`: top-K vector retrieval over `MemoryRepo`.
 //!
-//! Phase 3 implementation: cosine similarity, no decay (R=1.0), no hybrid.
-//! The Phase 8 lifecycle layer composes its retention factor on top.
+//! Composite score (paper Eq. 3):  score(m, q) = relevance(m, q) * R(m)^α.
+//! `relevance` is cosine similarity for dense, RRF-fused score for hybrid.
+//! `R(m)` is the lifecycle retention factor (paper Eq. 1, power-law).
+//! `α` is `retrieval_score_exponent` from the lifecycle config (default 0.3).
 
 use crate::{cosine_similarity, SearchError};
-use cognitive_memory_store::{MemoryRepo, Store};
+use cognitive_memory_lifecycle::{
+    base_decay_rate_for_category, compute_retention, parse_category, DecayModel, LifecycleConfig,
+    MemoryState,
+};
+use cognitive_memory_store::{AssociationRepo, MemoryRepo, SearchCandidate, Store};
+
+/// Build a `MemoryState` view from a `SearchCandidate` row, ready for
+/// `compute_retention`. Pulled out so the Searcher stays focused.
+fn candidate_to_state(c: &SearchCandidate) -> MemoryState {
+    MemoryState {
+        last_accessed_at: c.last_accessed_at,
+        created_at: c.created_at,
+        stability: c.stability,
+        importance: c.importance,
+        base_decay_rate: base_decay_rate_for_category(&c.category),
+        floor: c.retention_floor,
+        is_stub: c.is_stub,
+        access_count: c.retrieval_count as u64,
+        session_count: 0,
+        category: parse_category(&c.category),
+    }
+}
+
+/// The lifecycle config the daemon's search uses. Power-law decay,
+/// α=0.3 — paper-faithful defaults.
+fn search_lifecycle_config() -> LifecycleConfig {
+    LifecycleConfig {
+        decay_model: DecayModel::Power,
+        ..LifecycleConfig::default()
+    }
+}
 
 /// One result row returned by `Searcher::search`.
 #[derive(Debug, Clone)]
@@ -39,6 +71,18 @@ pub struct SearchOptions {
     /// Original query text, required when `hybrid = true`. Ignored
     /// otherwise.
     pub query_text: Option<String>,
+    /// Walk the association graph from the top dense hits this many
+    /// hops, adding linked memories to the result set with score
+    /// `relevance * R^α * edge_weight`. 0 disables; SDK default is 1.
+    pub graph_expansion_hops: usize,
+    /// Minimum association weight for graph expansion / bridge
+    /// discovery edges. Edges weaker than this are not traversed.
+    pub min_bridge_edge_weight: f64,
+    /// Run BFS bridge discovery between the top-3 anchor results,
+    /// attaching evidence chains to the response. Off by default.
+    pub bridge_discovery: bool,
+    /// Cap on bridge paths returned. Default 3.
+    pub max_bridge_paths: usize,
 }
 
 impl SearchOptions {
@@ -51,6 +95,10 @@ impl SearchOptions {
             now,
             hybrid: false,
             query_text: None,
+            graph_expansion_hops: 0,
+            min_bridge_edge_weight: 0.3,
+            bridge_discovery: false,
+            max_bridge_paths: 3,
         }
     }
 }
@@ -93,6 +141,9 @@ impl<'a> Searcher<'a> {
             )
             .await?;
 
+        let life_cfg = search_lifecycle_config();
+        let alpha = life_cfg.retrieval_score_exponent;
+
         let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             let memory_vec = candidate.embedding_vec();
@@ -102,13 +153,17 @@ impl<'a> Searcher<'a> {
                     memory: memory_vec.len(),
                 });
             }
-            let sim = cosine_similarity(query_vec, &memory_vec);
+            let sim = cosine_similarity(query_vec, &memory_vec) as f64;
+            let state = candidate_to_state(&candidate);
+            let retention = compute_retention(&state, options.now, &life_cfg);
+            // Equation 3: score = relevance * R^α.
+            let composite = sim * retention.powf(alpha);
             scored.push(SearchResult {
                 memory_id: candidate.id,
                 content: candidate.content,
                 category: candidate.category,
                 memory_type: candidate.memory_type,
-                score: sim,
+                score: composite as f32,
             });
         }
 
@@ -120,18 +175,16 @@ impl<'a> Searcher<'a> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        // Hybrid: fuse dense ordering with BM25 via RRF.
         if options.hybrid {
             let query_text = options.query_text.as_deref().ok_or_else(|| {
                 SearchError::InvalidQuery(
                     "hybrid mode requires query_text in SearchOptions".to_string(),
                 )
             })?;
-            // Fetch a wider candidate set from BM25 to give RRF something
-            // to fuse against. Pull 4× the limit; final limit applied after.
             let bm25_limit = (options.limit * 4).max(20);
             let bm25_ids = repo.bm25_search(user_id, query_text, bm25_limit).await?;
 
-            // Build ranked-hit lists from the dense scoring above plus BM25.
             let dense_ranked: Vec<crate::RankedHit> = scored
                 .iter()
                 .enumerate()
@@ -151,10 +204,9 @@ impl<'a> Searcher<'a> {
 
             let fused = crate::reciprocal_rank_fusion(&[&dense_ranked, &sparse_ranked], 60);
 
-            // Re-order `scored` by the fused ordering. Items only present
-            // in BM25 (no dense score) are dropped — the daemon only
-            // surfaces memories whose embedding is present and matches the
-            // current (provider, model) pair.
+            // Items only present in BM25 (no dense score) are dropped —
+            // the daemon only surfaces memories whose embedding matches
+            // the current (provider, model) pair.
             let mut by_id: std::collections::HashMap<String, SearchResult> = scored
                 .into_iter()
                 .map(|r| (r.memory_id.clone(), r))
@@ -166,11 +218,184 @@ impl<'a> Searcher<'a> {
                     hybrid_scored.push(r);
                 }
             }
-            hybrid_scored.truncate(options.limit);
-            return Ok(hybrid_scored);
+            scored = hybrid_scored;
+        }
+
+        // Graph expansion: walk associations from the top hits, scoring
+        // newly-discovered memories by relevance * R^α * edge_weight.
+        if options.graph_expansion_hops > 0 && !scored.is_empty() {
+            self.expand_via_graph(user_id, query_vec, &mut scored, &life_cfg, alpha, options)
+                .await?;
+            // Re-sort after expansion adds new entries.
+            scored.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
 
         scored.truncate(options.limit);
         Ok(scored)
     }
+
+    /// Walk the association graph from the current top hits, adding
+    /// linked memories to `scored` with `relevance * R^α * edge_weight`.
+    /// Multi-hop: each hop's discovered memories become the next hop's
+    /// frontier. Already-included IDs are skipped to avoid double-counting.
+    async fn expand_via_graph(
+        &self,
+        user_id: &str,
+        query_vec: &[f32],
+        scored: &mut Vec<SearchResult>,
+        life_cfg: &LifecycleConfig,
+        alpha: f64,
+        options: &SearchOptions,
+    ) -> Result<(), SearchError> {
+        use cognitive_memory_lifecycle::base_decay_rate_for_category as base_rate;
+        let assoc_repo = AssociationRepo::new(self.store);
+
+        // Initial frontier: top hits to expand from. Limited to the
+        // result limit so we don't blow up on a 10k-result set.
+        let mut already_have: std::collections::HashSet<String> =
+            scored.iter().map(|r| r.memory_id.clone()).collect();
+        let mut frontier_ids: Vec<String> = scored
+            .iter()
+            .take(options.limit.max(5))
+            .map(|r| r.memory_id.clone())
+            .collect();
+
+        for _hop in 0..options.graph_expansion_hops {
+            if frontier_ids.is_empty() {
+                break;
+            }
+            let linked = assoc_repo
+                .linked_for_many(user_id, &frontier_ids, options.min_bridge_edge_weight)
+                .await?;
+            let mut next_frontier = Vec::new();
+            for lm in linked {
+                if already_have.contains(&lm.memory.id) {
+                    continue;
+                }
+                let Some(emb_bytes) = &lm.memory.embedding else {
+                    continue;
+                };
+                let memory_vec: Vec<f32> = emb_bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                if memory_vec.len() != query_vec.len() {
+                    continue;
+                }
+                let sim = cosine_similarity(query_vec, &memory_vec) as f64;
+
+                let state = MemoryState {
+                    last_accessed_at: lm.memory.last_accessed_at,
+                    created_at: lm.memory.created_at,
+                    stability: lm.memory.stability,
+                    importance: lm.memory.importance,
+                    base_decay_rate: base_rate(&lm.memory.category),
+                    floor: lm.memory.retention_floor,
+                    is_stub: lm.memory.is_stub,
+                    access_count: lm.memory.retrieval_count as u64,
+                    session_count: 0,
+                    category: parse_category(&lm.memory.category),
+                };
+                let retention = compute_retention(&state, options.now, life_cfg);
+                let composite = sim * retention.powf(alpha) * lm.link_strength;
+
+                scored.push(SearchResult {
+                    memory_id: lm.memory.id.clone(),
+                    content: lm.memory.content.clone(),
+                    category: lm.memory.category.clone(),
+                    memory_type: lm.memory.memory_type.clone(),
+                    score: composite as f32,
+                });
+                already_have.insert(lm.memory.id.clone());
+                next_frontier.push(lm.memory.id);
+            }
+            frontier_ids = next_frontier;
+        }
+        Ok(())
+    }
+
+    /// BFS bridge discovery: find shortest paths through the
+    /// association graph between the top-3 anchor results, max depth 3.
+    /// Returns a list of paths, each `[anchor_a, ..., anchor_b]` where
+    /// the intermediate nodes are bridge memories.
+    ///
+    /// Mirrors `_find_bridge_paths` + `_bfs_path` in the Python SDK
+    /// (engine.py:301–357). Anchors are passed in by the caller — the
+    /// search handler walks its top-K results.
+    pub async fn find_bridges(
+        &self,
+        anchors: &[String],
+        options: &SearchOptions,
+    ) -> Result<Vec<Vec<String>>, SearchError> {
+        if !options.bridge_discovery || anchors.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let assoc_repo = AssociationRepo::new(self.store);
+        let pool: Vec<&String> = anchors.iter().take(3).collect();
+        let mut chains: Vec<Vec<String>> = Vec::new();
+
+        for i in 0..pool.len() {
+            for j in (i + 1)..pool.len() {
+                if chains.len() >= options.max_bridge_paths {
+                    break;
+                }
+                if let Some(path) = bfs_path(
+                    &assoc_repo,
+                    pool[i],
+                    pool[j],
+                    3,
+                    options.min_bridge_edge_weight,
+                )
+                .await?
+                {
+                    // Non-trivial: at least one intermediate node.
+                    if path.len() > 2 {
+                        chains.push(path);
+                    }
+                }
+            }
+        }
+        Ok(chains)
+    }
+}
+
+/// BFS shortest path through the association graph from `from` to `to`.
+/// Edges below `min_weight` are not traversed. Returns `None` if no
+/// path within `max_depth` hops.
+async fn bfs_path(
+    assoc_repo: &AssociationRepo<'_>,
+    from: &str,
+    to: &str,
+    max_depth: usize,
+    min_weight: f64,
+) -> Result<Option<Vec<String>>, SearchError> {
+    use std::collections::{HashSet, VecDeque};
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(from.to_string());
+    let mut queue: VecDeque<(String, Vec<String>)> = VecDeque::new();
+    queue.push_back((from.to_string(), vec![from.to_string()]));
+
+    while let Some((current, path)) = queue.pop_front() {
+        if path.len() > max_depth {
+            continue;
+        }
+        let edges = assoc_repo.neighbor_edges(&current, min_weight).await?;
+        for (neighbor, _weight) in edges {
+            if visited.contains(&neighbor) {
+                continue;
+            }
+            let mut new_path = path.clone();
+            new_path.push(neighbor.clone());
+            if neighbor == to {
+                return Ok(Some(new_path));
+            }
+            visited.insert(neighbor.clone());
+            queue.push_back((neighbor, new_path));
+        }
+    }
+    Ok(None)
 }

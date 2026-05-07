@@ -115,15 +115,16 @@ fn score_combines_relevance_and_retention_with_alpha() {
     let now: i64 = 1_700_000_000;
     let mem = baseline_memory(now, 0.0); // R = 1.0
     let cfg = LifecycleConfig::default();
+    let alpha = cfg.retrieval_score_exponent;
     let s = score_memory(&mem, 0.7, now, &cfg);
-    // R^0.5 = 1.0; score = 0.7
+    // R^α = 1.0 regardless of α; score = relevance.
     assert!(approx_eq(s, 0.7, TOL), "got {s}");
 
-    // dt=15 days → R = exp(-1) ≈ 0.367879
-    // score = 0.7 * 0.367879^0.5 = 0.7 * 0.606530 ≈ 0.424571
+    // dt=15 days → R = exp(-1) ≈ 0.367879. Score uses the lifecycle
+    // config's α (0.3 per SDK parity).
     let mem2 = baseline_memory(now, 15.0);
     let s2 = score_memory(&mem2, 0.7, now, &cfg);
-    let expected = 0.7_f64 * (-1.0_f64).exp().powf(0.5);
+    let expected = 0.7_f64 * (-1.0_f64).exp().powf(alpha);
     assert!(
         approx_eq(s2, expected, TOL),
         "expected {expected}, got {s2}"

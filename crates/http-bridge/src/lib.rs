@@ -238,6 +238,8 @@ async fn memory_search(
         limit: body.limit,
         deep_recall: body.deep_recall,
         hybrid: body.hybrid,
+        graph_expansion_hops: 0,
+        bridge_discovery: false,
     }));
     daemon_call(&mut client, req).await
 }

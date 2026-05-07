@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 cognitive-memory-core = { workspace = true }
 cognitive-memory-store = { workspace = true }
+cognitive-memory-lifecycle = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

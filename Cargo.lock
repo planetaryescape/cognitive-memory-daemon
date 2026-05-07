@@ -720,6 +720,7 @@ dependencies = [
  "chrono",
  "cognitive-memory-core",
  "cognitive-memory-embeddings",
+ "cognitive-memory-lifecycle",
  "cognitive-memory-store",
  "pretty_assertions",
  "sqlx",

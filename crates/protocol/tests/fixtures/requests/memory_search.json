@@ -9,7 +9,9 @@
       "query": "How does the user feel about mocks?",
       "limit": 5,
       "deep_recall": false,
-      "hybrid": false
+      "hybrid": false,
+      "graph_expansion_hops": 0,
+      "bridge_discovery": false
     }
   }
 }

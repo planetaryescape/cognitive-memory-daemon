@@ -14,7 +14,8 @@
             "memory_type": "preference",
             "score": 0.87
           }
-        ]
+        ],
+        "bridge_paths": []
       }
     }
   }

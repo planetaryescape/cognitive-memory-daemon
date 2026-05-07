@@ -480,6 +480,14 @@ pub struct SearchMemoryArgs {
     /// is dense-only — additive field, no protocol version bump.
     #[serde(default)]
     pub hybrid: bool,
+    /// Walk the association graph from the top hits, scoring linked
+    /// memories as `relevance * R^α * edge_weight`. 0 disables. Additive.
+    #[serde(default)]
+    pub graph_expansion_hops: usize,
+    /// Run BFS bridge discovery between top-3 anchors, returning
+    /// evidence chains. Off by default. Additive.
+    #[serde(default)]
+    pub bridge_discovery: bool,
 }
 
 fn default_limit() -> usize {
@@ -658,6 +666,12 @@ pub struct MemoryStoredData {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemorySearchResultsData {
     pub results: Vec<SearchHit>,
+    /// Evidence chains from bridge discovery: each path is a list of
+    /// memory IDs `[anchor_a, intermediate_1, ..., anchor_b]` showing
+    /// how the top anchors connect through the association graph.
+    /// Empty unless `bridge_discovery=true` on the request. Additive.
+    #[serde(default)]
+    pub bridge_paths: Vec<Vec<String>>,
 }
 
 /// One hit in a search response.

@@ -49,7 +49,10 @@ impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {
             decay_model: DecayModel::Exponential,
-            retrieval_score_exponent: 0.5,
+            // α=0.3 matches the Python SDK default (types.py:96). Lower
+            // alpha means decay weighs *less* in scoring — old but
+            // exact-match memories still rank well.
+            retrieval_score_exponent: 0.3,
             power_decay_gamma: 0.7,
             direct_boost: 0.1,
             associative_boost: 0.03,

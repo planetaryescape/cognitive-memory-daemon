@@ -331,10 +331,16 @@ async fn handle_memory_search(
         now,
         hybrid: args.hybrid,
         query_text: Some(args.query.clone()),
+        graph_expansion_hops: args.graph_expansion_hops,
+        min_bridge_edge_weight: 0.3,
+        bridge_discovery: args.bridge_discovery,
+        max_bridge_paths: 3,
     };
-    let results = Searcher::new(&state.store)
-        .search(&args.user_id, &query_vec, &opts)
-        .await?;
+    let searcher = Searcher::new(&state.store);
+    let results = searcher.search(&args.user_id, &query_vec, &opts).await?;
+    let anchor_ids: Vec<String> = results.iter().map(|r| r.memory_id.clone()).collect();
+    let bridge_paths = searcher.find_bridges(&anchor_ids, &opts).await?;
+
     let hits: Vec<SearchHit> = results
         .into_iter()
         .map(|r| SearchHit {
@@ -346,7 +352,10 @@ async fn handle_memory_search(
         })
         .collect();
     Ok(Response::ok(ResponseData::MemorySearchResults(
-        MemorySearchResultsData { results: hits },
+        MemorySearchResultsData {
+            results: hits,
+            bridge_paths,
+        },
     )))
 }
 
@@ -570,6 +579,10 @@ async fn handle_vector_search(
         now,
         hybrid: false,
         query_text: None,
+        graph_expansion_hops: 0,
+        min_bridge_edge_weight: 0.3,
+        bridge_discovery: false,
+        max_bridge_paths: 3,
     };
     let results = Searcher::new(&state.store)
         .search(&args.user_id, &args.embedding, &opts)
@@ -585,7 +598,10 @@ async fn handle_vector_search(
         })
         .collect();
     Ok(Response::ok(ResponseData::MemorySearchResults(
-        MemorySearchResultsData { results: hits },
+        MemorySearchResultsData {
+            results: hits,
+            bridge_paths: Vec::new(),
+        },
     )))
 }
 
@@ -708,10 +724,28 @@ async fn handle_find_fading(
 ) -> Result<Response, HandlerError> {
     require_user_match(&args.user_id, connection_user)?;
     let rows = MemoryRepo::new(&state.store)
-        .find_fading(&args.user_id, args.max_retention, args.limit)
+        .find_fading_candidates(&args.user_id)
         .await?;
+
+    // Compute retention per candidate, keep those at or below the
+    // threshold, sort ascending (most-faded first), trim to limit.
+    let now = unix_now();
+    let mut scored: Vec<(MemoryRow, f64)> = rows
+        .into_iter()
+        .map(|row| {
+            let r = compute_current_retention(&row, now);
+            (row, r)
+        })
+        .filter(|(_, r)| *r <= args.max_retention)
+        .collect();
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(args.limit as usize);
+
     Ok(Response::ok(ResponseData::Memories(MemoriesData {
-        memories: rows.into_iter().map(memory_row_to_data).collect(),
+        memories: scored
+            .into_iter()
+            .map(|(row, _)| memory_row_to_data(row))
+            .collect(),
     })))
 }
 

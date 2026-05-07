@@ -116,6 +116,8 @@ async fn store_then_search_returns_the_stored_memory() {
             limit: 5,
             deep_recall: false,
             hybrid: false,
+            graph_expansion_hops: 0,
+            bridge_discovery: false,
         })))
         .await
         .unwrap();
@@ -525,6 +527,8 @@ async fn search_isolates_results_by_user_id_at_the_daemon_layer() {
             limit: 5,
             deep_recall: false,
             hybrid: false,
+            graph_expansion_hops: 0,
+            bridge_discovery: false,
         })))
         .await
         .unwrap();
@@ -898,6 +902,8 @@ async fn deep_recall_surfaces_superseded_memories() {
                 limit: 10,
                 deep_recall: deep,
                 hybrid: false,
+                graph_expansion_hops: 0,
+                bridge_discovery: false,
             })))
             .await
             .unwrap();

@@ -92,6 +92,14 @@ enum Command {
         deep_recall: bool,
         #[arg(long)]
         hybrid: bool,
+        /// Walk the association graph N hops from top hits, scoring
+        /// linked memories as relevance * R^α * edge_weight. 0 = off.
+        #[arg(long, default_value_t = 0)]
+        graph_hops: usize,
+        /// Run BFS bridge discovery between top-3 anchors, returning
+        /// evidence chains in the response.
+        #[arg(long)]
+        bridge_discovery: bool,
     },
 
     /// BM25-only lexical search. Returns matching memory IDs.
@@ -327,12 +335,16 @@ async fn run_command(client: &mut Client, cli: &Cli) -> Result<Response> {
             limit,
             deep_recall,
             hybrid,
+            graph_hops,
+            bridge_discovery,
         } => Request::Memory(MemoryRequest::Search(SearchMemoryArgs {
             user_id: user,
             query: query.clone(),
             limit: *limit,
             deep_recall: *deep_recall,
             hybrid: *hybrid,
+            graph_expansion_hops: *graph_hops,
+            bridge_discovery: *bridge_discovery,
         })),
 
         Command::SearchLexical { query, limit } => {
@@ -637,6 +649,12 @@ fn print_human(resp: &Response) {
             } else {
                 for hit in &r.results {
                     let _ = writeln!(out, "{:.3}\t{}\t{}", hit.score, hit.memory_id, hit.content);
+                }
+            }
+            if !r.bridge_paths.is_empty() {
+                let _ = writeln!(out, "bridges:");
+                for path in &r.bridge_paths {
+                    let _ = writeln!(out, "  {}", path.join(" -> "));
                 }
             }
         }

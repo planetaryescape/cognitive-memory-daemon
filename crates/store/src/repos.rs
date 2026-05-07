@@ -22,8 +22,15 @@ pub struct SearchCandidate {
     pub category: String,
     pub memory_type: String,
     pub last_accessed_at: i64,
+    pub created_at: i64,
     pub retention_floor: f64,
     pub retrieval_count: i64,
+    /// Retention-time inputs needed for R^α weighting (Eq. 3) and
+    /// graph-expansion path scoring. Cheap to read since these are
+    /// already on the row.
+    pub stability: f64,
+    pub importance: f64,
+    pub is_stub: bool,
 }
 
 impl SearchCandidate {
@@ -499,24 +506,23 @@ impl<'a> MemoryRepo<'a> {
         Ok(r.rows_affected() > 0)
     }
 
-    /// Find memories whose retention_floor is below `max_retention` —
-    /// candidates for consolidation. Excludes already-superseded and stubs.
-    pub async fn find_fading(
+    /// Fetch the candidate set the lifecycle layer will scan for fading
+    /// memories. Returns all hot, non-superseded, non-stub rows under
+    /// the user. The caller computes retention(now) per row and filters
+    /// by the threshold — power-law decay can't be expressed in SQL, so
+    /// computation moves up the stack.
+    pub async fn find_fading_candidates(
         &self,
         user_id: &str,
-        max_retention: f64,
-        limit: i64,
     ) -> Result<Vec<MemoryRow>, sqlx::Error> {
         let sql = format!(
             "SELECT {ALL_FIELDS} FROM memories
              WHERE user_id = ? AND is_superseded = 0 AND is_stub = 0
-               AND retention_floor < ?
-             ORDER BY retention_floor ASC LIMIT ?"
+               AND is_cold = 0
+             ORDER BY last_accessed_at ASC"
         );
         sqlx::query_as::<_, MemoryRow>(&sql)
             .bind(user_id)
-            .bind(max_retention)
-            .bind(limit)
             .fetch_all(self.reader)
             .await
     }
@@ -615,7 +621,8 @@ impl<'a> MemoryRepo<'a> {
         // archival purpose.
         let sql = if include_expired {
             "SELECT id, content, embedding, category, memory_type, last_accessed_at,
-                    retention_floor, retrieval_count
+                    created_at, retention_floor, retrieval_count,
+                    stability, importance, is_stub
              FROM memories
              WHERE user_id = ? AND embedding IS NOT NULL
                AND embedding_provider = ? AND embedding_model = ?
@@ -623,7 +630,8 @@ impl<'a> MemoryRepo<'a> {
                AND (valid_from IS NULL OR valid_from <= ?)"
         } else {
             "SELECT id, content, embedding, category, memory_type, last_accessed_at,
-                    retention_floor, retrieval_count
+                    created_at, retention_floor, retrieval_count,
+                    stability, importance, is_stub
              FROM memories
              WHERE user_id = ? AND embedding IS NOT NULL
                AND embedding_provider = ? AND embedding_model = ?
@@ -863,6 +871,26 @@ impl<'a> AssociationRepo<'a> {
                 })
             })
             .collect())
+    }
+
+    /// Lightweight neighbor query for graph-walking algorithms (bridge
+    /// BFS). Returns `(target_id, weight)` pairs without joining
+    /// through `memories` — just the edges. Sorted by weight desc so
+    /// strong edges are visited first.
+    pub async fn neighbor_edges(
+        &self,
+        source_id: &str,
+        min_weight: f64,
+    ) -> Result<Vec<(String, f64)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT target_memory_id, weight FROM associations
+             WHERE source_memory_id = ? AND weight >= ?
+             ORDER BY weight DESC",
+        )
+        .bind(source_id)
+        .bind(min_weight)
+        .fetch_all(self.reader)
+        .await
     }
 
     /// Delete a directed link.
