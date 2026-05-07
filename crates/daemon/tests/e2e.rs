@@ -17,7 +17,7 @@ use cognitive_memory_protocol::{
     BatchMemoryEntry, BridgeScope, ClearArgs, CountsArgs, DeleteMemoryArgs, DiagnosticsRequest,
     GetLinkedArgs, GetMemoryArgs, LifecycleRequest, LinkMemoryArgs, ListMemoryArgs, MemoryRequest,
     MintBridgeTokenArgs, Request, ResponseData, SearchMemoryArgs, StoreBatchArgs, StoreMemoryArgs,
-    UpdateMemoryArgs,
+    TickArgs, UpdateMemoryArgs, UpdateRetentionArgs,
 };
 use cognitive_memory_store::Store;
 use pretty_assertions::assert_eq;
@@ -641,6 +641,316 @@ async fn status_uptime_advances_with_wall_clock() {
     assert!(
         second_uptime > first_uptime,
         "uptime must advance: first={first_uptime}s second={second_uptime}s"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+// ===========================================================================
+// Phase 8 — decay-on-read + tick consolidation
+// ===========================================================================
+//
+// These tests exercise the lifecycle wiring end-to-end. The trick is
+// that decay is wall-clock-based, so we backdate `last_accessed_at`
+// directly via SQL on the daemon's underlying store before reading,
+// rather than waiting real days.
+
+async fn store_helper(client: &mut Client, content: &str, category: &str) -> String {
+    let resp = client
+        .request(Request::Memory(MemoryRequest::Store(StoreMemoryArgs {
+            user_id: "alice".to_string(),
+            content: content.to_string(),
+            category: category.to_string(),
+            memory_type: "fact".to_string(),
+            metadata: "{}".to_string(),
+            importance: None,
+        })))
+        .await
+        .unwrap();
+    match resp.data.unwrap() {
+        ResponseData::MemoryStored(s) => s.id,
+        other => panic!("expected MemoryStored, got {other:?}"),
+    }
+}
+
+async fn fetch(client: &mut Client, id: &str) -> cognitive_memory_protocol::MemoryData {
+    let resp = client
+        .request(Request::Memory(MemoryRequest::Get(GetMemoryArgs {
+            user_id: "alice".to_string(),
+            id: id.to_string(),
+        })))
+        .await
+        .unwrap();
+    match resp.data.unwrap() {
+        ResponseData::Memory(m) => m,
+        other => panic!("expected Memory, got {other:?}"),
+    }
+}
+
+async fn backdate(store: &Store, id: &str, days_ago: i64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let when = now - days_ago * 86400;
+    sqlx::query("UPDATE memories SET last_accessed_at = ?, created_at = ? WHERE id = ?")
+        .bind(when)
+        .bind(when)
+        .bind(id)
+        .execute(store.writer())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn current_retention_decays_over_time_per_category() {
+    let (handle, socket, shutdown, tmp) = boot_daemon().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let episodic_id = store_helper(&mut client, "an episode", "episodic").await;
+    let semantic_id = store_helper(&mut client, "a fact", "semantic").await;
+    let core_id = store_helper(&mut client, "core knowledge", "core").await;
+    let proc_id = store_helper(&mut client, "step-by-step", "procedural").await;
+
+    // Fresh memories: retention near 1.0.
+    let fresh_episodic = fetch(&mut client, &episodic_id).await;
+    assert!(
+        fresh_episodic.current_retention > 0.99,
+        "fresh episodic retention should be ~1.0, got {}",
+        fresh_episodic.current_retention
+    );
+
+    // Backdate everything 365 days. Reach into the daemon's SQLite to
+    // edit last_accessed_at directly — there is no IPC op to set it.
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    for id in [&episodic_id, &semantic_id, &core_id, &proc_id] {
+        backdate(&store, id, 365).await;
+    }
+    drop(store);
+
+    let aged_episodic = fetch(&mut client, &episodic_id).await;
+    let aged_semantic = fetch(&mut client, &semantic_id).await;
+    let aged_core = fetch(&mut client, &core_id).await;
+    let aged_proc = fetch(&mut client, &proc_id).await;
+
+    // Episodic (β=45d) should drop sharply: power-law with γ=0.7,
+    // S=0.5, B=1.0 (importance=0). Effective rate = 0.5*1*45 = 22.5.
+    // raw = (1 + 365/22.5)^-0.7 = ~16.2^-0.7 ≈ 0.144. Floor=0.0.
+    assert!(
+        aged_episodic.current_retention < 0.20,
+        "episodic at 365d should be < 0.20, got {}",
+        aged_episodic.current_retention
+    );
+
+    // Semantic (β=120d): effective = 60. raw = (1 + 365/60)^-0.7
+    // = ~7.08^-0.7 ≈ 0.265.
+    assert!(
+        aged_semantic.current_retention > 0.20 && aged_semantic.current_retention < 0.35,
+        "semantic at 365d should be in (0.20, 0.35), got {}",
+        aged_semantic.current_retention
+    );
+
+    // Core (β=120d, but floor=0.6 from --core / category=core):
+    // raw decay matches semantic (~0.265), but clamps to floor 0.6.
+    assert!(
+        (aged_core.current_retention - 0.6).abs() < 1e-9,
+        "core at 365d should clamp at floor 0.6, got {}",
+        aged_core.current_retention
+    );
+
+    // Procedural: base_decay_rate is INFINITY, retention always 1.0.
+    assert!(
+        (aged_proc.current_retention - 1.0).abs() < 1e-9,
+        "procedural at 365d should still be 1.0, got {}",
+        aged_proc.current_retention
+    );
+
+    // Differential check: episodic decays faster than semantic.
+    assert!(
+        aged_episodic.current_retention < aged_semantic.current_retention,
+        "episodic ({}) should decay faster than semantic ({})",
+        aged_episodic.current_retention,
+        aged_semantic.current_retention
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn tick_increments_days_at_floor_for_at_floor_memories_and_resets_others() {
+    let (handle, socket, shutdown, tmp) = boot_daemon().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let id_floor = store_helper(&mut client, "will floor", "semantic").await;
+    let id_fresh = store_helper(&mut client, "stays fresh", "semantic").await;
+
+    // Pin id_floor's retention floor high, then backdate it so its
+    // computed retention is at floor. id_fresh stays as-is.
+    client
+        .request(Request::Lifecycle(LifecycleRequest::UpdateRetention(
+            UpdateRetentionArgs {
+                user_id: "alice".to_string(),
+                id: id_floor.clone(),
+                retention_floor: 0.5,
+            },
+        )))
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    backdate(&store, &id_floor, 365).await;
+    drop(store);
+
+    // First tick — id_floor at floor, id_fresh not.
+    let resp = client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+    let decayed = match resp.data.unwrap() {
+        ResponseData::Tick(t) => t.memories_decayed,
+        other => panic!("expected Tick, got {other:?}"),
+    };
+    assert_eq!(decayed, 1, "exactly one memory should be at floor");
+
+    let after_first = fetch(&mut client, &id_floor).await;
+    assert_eq!(after_first.days_at_floor, 1);
+    let fresh_after = fetch(&mut client, &id_fresh).await;
+    assert_eq!(fresh_after.days_at_floor, 0);
+
+    // Tick 4 more times → days_at_floor=5.
+    for _ in 0..4 {
+        client
+            .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+                synchronous: true,
+            })))
+            .await
+            .unwrap();
+    }
+    let after_five = fetch(&mut client, &id_floor).await;
+    assert_eq!(after_five.days_at_floor, 5);
+
+    // "Refresh" the at-floor memory by un-backdating it. Then a tick
+    // should reset days_at_floor to 0.
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    sqlx::query("UPDATE memories SET last_accessed_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(&id_floor)
+        .execute(store.writer())
+        .await
+        .unwrap();
+    drop(store);
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+    let after_reset = fetch(&mut client, &id_floor).await;
+    assert_eq!(after_reset.days_at_floor, 0, "tick should reset on refresh");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// SDK parity (engine.py: `include_superseded = deep_recall`).
+/// Default search must hide superseded memories; `--deep-recall` must
+/// surface them so the audit trail is reachable through search.
+#[tokio::test]
+async fn deep_recall_surfaces_superseded_memories() {
+    let (handle, socket, shutdown, _tmp) = boot_daemon().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let old_id = store_helper(&mut client, "User likes blue", "semantic").await;
+    let new_id = store_helper(&mut client, "User now prefers green", "semantic").await;
+
+    use cognitive_memory_protocol::MarkSupersededArgs;
+    client
+        .request(Request::Lifecycle(LifecycleRequest::MarkSuperseded(
+            MarkSupersededArgs {
+                user_id: "alice".to_string(),
+                summary_id: new_id.clone(),
+                ids: vec![old_id.clone()],
+            },
+        )))
+        .await
+        .unwrap();
+
+    async fn ids_for_search(client: &mut Client, deep: bool) -> Vec<String> {
+        let r = client
+            .request(Request::Memory(MemoryRequest::Search(SearchMemoryArgs {
+                user_id: "alice".to_string(),
+                query: "User likes blue".to_string(),
+                limit: 10,
+                deep_recall: deep,
+                hybrid: false,
+            })))
+            .await
+            .unwrap();
+        match r.data.unwrap() {
+            ResponseData::MemorySearchResults(rs) => {
+                rs.results.into_iter().map(|h| h.memory_id).collect()
+            }
+            other => panic!("expected MemorySearchResults, got {other:?}"),
+        }
+    }
+
+    let default_ids = ids_for_search(&mut client, false).await;
+    assert!(
+        !default_ids.contains(&old_id),
+        "default search must NOT include superseded {old_id}; got {default_ids:?}"
+    );
+
+    let deep_ids = ids_for_search(&mut client, true).await;
+    assert!(
+        deep_ids.contains(&old_id),
+        "deep_recall search MUST include superseded {old_id}; got {deep_ids:?}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn stub_returns_retention_zero_regardless_of_age() {
+    let (handle, socket, shutdown, _tmp) = boot_daemon().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let id = store_helper(&mut client, "becomes a stub", "semantic").await;
+    use cognitive_memory_protocol::ConvertToStubArgs;
+    client
+        .request(Request::Lifecycle(LifecycleRequest::ConvertToStub(
+            ConvertToStubArgs {
+                user_id: "alice".to_string(),
+                id: id.clone(),
+                stub_content: "[archived]".to_string(),
+            },
+        )))
+        .await
+        .unwrap();
+
+    let m = fetch(&mut client, &id).await;
+    assert!(m.is_stub);
+    assert!(
+        m.current_retention.abs() < 1e-9,
+        "stub retention must be 0, got {}",
+        m.current_retention
     );
 
     let _ = shutdown.send(());

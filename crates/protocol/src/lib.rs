@@ -589,6 +589,18 @@ pub struct MemoryData {
     pub is_stub: bool,
     pub stub_content: Option<String>,
     pub metadata: String,
+    /// Retention factor R(m) computed at response time using the paper's
+    /// power-law formula. Reflects the *current* decayed value, not the
+    /// stored `retention_floor`. Always in `[retention_floor, 1.0]`.
+    /// Stubs return 0.0; procedural memories return 1.0.
+    #[serde(default)]
+    pub current_retention: f64,
+    /// How many ticks the memory has been at its retention floor.
+    /// Increments on each `cm tick` while at-floor; resets to 0 once
+    /// retention recovers (e.g. via access). Used for cold-migration
+    /// candidacy.
+    #[serde(default)]
+    pub days_at_floor: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

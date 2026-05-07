@@ -5,6 +5,9 @@
 //! paper-faithful StoreBatch with co-creation auto-association.
 
 use cognitive_memory_embeddings::{CachedEmbeddings, EmbeddingError, EmbeddingProvider};
+use cognitive_memory_lifecycle::{
+    base_decay_rate_for_category, compute_retention, parse_category, LifecycleConfig, MemoryState,
+};
 use cognitive_memory_protocol::{
     AffectedData, BatchUpdateArgs, BridgeTokenData, ClearArgs, ConvertToStubArgs, CountsArgs,
     CountsData, DeleteManyMemoryArgs, DeleteMemoryArgs, DiagnosticsRequest, FindFadingArgs,
@@ -655,13 +658,46 @@ async fn handle_lifecycle_request(
     }
 }
 
-async fn handle_tick(_args: TickArgs, _state: &Arc<AppState>) -> Result<Response, HandlerError> {
-    // Phase 11+ wires the actual tick — decay materialisation, consolidation
-    // candidate scan. For now, returns success as a placeholder so clients
-    // can call the operation deterministically.
+async fn handle_tick(_args: TickArgs, state: &Arc<AppState>) -> Result<Response, HandlerError> {
+    // Walk every hot non-stub memory; compute its current retention; if
+    // retention has flatlined at the floor, increment `days_at_floor`,
+    // otherwise reset it to 0. `memories_decayed` reports the count
+    // currently at floor.
+    //
+    // This is the consolidation pass — it does not advance wall-clock
+    // time; decay is read-side. `days_at_floor` is what later passes use
+    // to decide cold-migration candidacy.
+    let now = unix_now();
+    let rows: Vec<MemoryRow> =
+        sqlx::query_as("SELECT * FROM memories WHERE is_cold = 0 AND is_stub = 0")
+            .fetch_all(state.store.reader())
+            .await?;
+
+    let mut decayed: u64 = 0;
+    let mut tx = state.store.writer().begin().await?;
+    for row in rows {
+        let retention = compute_current_retention(&row, now);
+        // "At floor" means the computed retention has clamped to the
+        // stored floor. Use a small epsilon for f64 comparison.
+        let at_floor = (retention - row.retention_floor).abs() < 1e-9 && row.retention_floor > 0.0;
+        if at_floor {
+            sqlx::query("UPDATE memories SET days_at_floor = days_at_floor + 1 WHERE id = ?")
+                .bind(&row.id)
+                .execute(&mut *tx)
+                .await?;
+            decayed += 1;
+        } else if row.days_at_floor > 0 {
+            sqlx::query("UPDATE memories SET days_at_floor = 0 WHERE id = ?")
+                .bind(&row.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    tx.commit().await?;
+
     Ok(Response::ok(ResponseData::Tick(TickResultData {
         completed: true,
-        memories_decayed: 0,
+        memories_decayed: decayed,
     })))
 }
 
@@ -805,6 +841,7 @@ fn require_user_match(arg_user: &str, connection_user: &str) -> Result<(), Handl
 }
 
 fn memory_row_to_data(row: MemoryRow) -> MemoryData {
+    let current_retention = compute_current_retention(&row, unix_now());
     MemoryData {
         id: row.id,
         user_id: row.user_id,
@@ -826,6 +863,38 @@ fn memory_row_to_data(row: MemoryRow) -> MemoryData {
         is_stub: row.is_stub,
         stub_content: row.stub_content,
         metadata: row.metadata,
+        current_retention,
+        days_at_floor: row.days_at_floor,
+    }
+}
+
+/// Compute R(m) for a memory row at the given wall-clock time using the
+/// paper's power-law decay model (Equation 1). Reads the memory's
+/// stability, importance, retention floor, and category-derived
+/// `base_decay_rate`.
+fn compute_current_retention(row: &MemoryRow, now: i64) -> f64 {
+    let state = MemoryState {
+        last_accessed_at: row.last_accessed_at,
+        created_at: row.created_at,
+        stability: row.stability,
+        importance: row.importance,
+        base_decay_rate: base_decay_rate_for_category(&row.category),
+        floor: row.retention_floor,
+        is_stub: row.is_stub,
+        access_count: row.retrieval_count as u64,
+        session_count: 0,
+        category: parse_category(&row.category),
+    };
+    compute_retention(&state, now, &lifecycle_config())
+}
+
+fn lifecycle_config() -> LifecycleConfig {
+    // Paper §3.2 defaults to power-law decay (gamma=0.7); the lifecycle
+    // crate's Default is exponential for backward-compat with the older
+    // SDK. The daemon ships the paper-faithful model.
+    LifecycleConfig {
+        decay_model: cognitive_memory_lifecycle::DecayModel::Power,
+        ..LifecycleConfig::default()
     }
 }
 

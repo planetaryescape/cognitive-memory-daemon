@@ -598,6 +598,7 @@ dependencies = [
  "cognitive-memory-client",
  "cognitive-memory-core",
  "cognitive-memory-embeddings",
+ "cognitive-memory-lifecycle",
  "cognitive-memory-protocol",
  "cognitive-memory-search",
  "cognitive-memory-store",

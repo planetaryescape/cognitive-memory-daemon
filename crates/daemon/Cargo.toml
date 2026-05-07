@@ -29,6 +29,7 @@ cognitive-memory-protocol = { workspace = true }
 cognitive-memory-store = { workspace = true }
 cognitive-memory-search = { workspace = true }
 cognitive-memory-embeddings = { workspace = true }
+cognitive-memory-lifecycle = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

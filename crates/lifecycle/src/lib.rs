@@ -99,6 +99,31 @@ pub enum Category {
     Core,
 }
 
+/// Parse a wire-form category string into the typed enum. Unknown
+/// strings fall back to Semantic, matching the Python SDK default.
+pub fn parse_category(s: &str) -> Category {
+    match s {
+        "episodic" => Category::Episodic,
+        "semantic" => Category::Semantic,
+        "procedural" => Category::Procedural,
+        "core" => Category::Core,
+        _ => Category::Semantic,
+    }
+}
+
+/// Base decay rate in days for a given category — Table 2 in the paper.
+/// Mirrors `BASE_DECAY_RATES` in `sdks/python/src/cognitive_memory/types.py`.
+/// `f64::INFINITY` means "never decays".
+pub fn base_decay_rate_for_category(category: &str) -> f64 {
+    match category {
+        "episodic" => 45.0,
+        "semantic" => 120.0,
+        "core" => 120.0,
+        "procedural" => f64::INFINITY,
+        _ => 120.0, // unknown → semantic default
+    }
+}
+
 /// `R(m) = max(floor, exp(-dt / (S * B * beta_c)))` (Equation 1 in the paper).
 ///
 /// Power-decay variant: `R(m) = max(floor, (1 + dt / (S*B*beta_c))^(-gamma))`.
