@@ -13,6 +13,9 @@ mod handlers;
 mod server;
 mod trace;
 
+// Config types live in core so the cli (which can't import daemon)
+// can read/write them. Re-exported here for daemon-side ergonomics.
+pub use cognitive_memory_core::{config_path, ConfigError, DaemonConfig, LlmConfig};
 pub use doctor::{run_doctor, CheckLevel, CheckResult, DoctorReport};
 pub use server::{Daemon, DaemonError};
 pub use trace::{Trace, TraceRing};

@@ -9,6 +9,12 @@ description = "LLM providers and extractor for cognitive-memory-daemon."
 [lints]
 workspace = true
 
+[features]
+# Off by default — keeps `cargo build` slim for users who use only
+# hosted providers or no LLM. Opt-in: `cargo build --features local-llm`.
+# Pulls llama.cpp via FFI; on Apple Silicon enables Metal acceleration.
+local-llm = ["dep:llama-cpp-2"]
+
 [dependencies]
 cognitive-memory-core = { workspace = true }
 async-trait = { workspace = true }
@@ -19,6 +25,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+llama-cpp-2 = { version = "0.1", optional = true, default-features = false, features = ["metal"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

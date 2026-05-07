@@ -14,11 +14,15 @@ use std::sync::{Arc, Mutex};
 
 mod anthropic;
 mod fake;
+#[cfg(feature = "local-llm")]
+mod local;
 mod openai;
 mod rate_limit;
 
 pub use anthropic::AnthropicProvider;
 pub use fake::FakeLlmProvider;
+#[cfg(feature = "local-llm")]
+pub use local::LocalLlmProvider;
 pub use openai::OpenAiProvider;
 pub use rate_limit::{RateLimiter, TokenBucket};
 

@@ -261,11 +261,68 @@ enum Command {
         #[arg(long, default_value_t = 30 * 24 * 3600)]
         ttl_seconds: u64,
     },
+
+    /// Download a local LLM model GGUF into the model cache. Default
+    /// model: Qwen3-4B-Instruct-2507 Q4_K_M (~2.5 GB, Apache 2.0).
+    /// Used by the conflict-judge and consolidation passes when
+    /// `cm config set-llm local` is configured.
+    DownloadModel {
+        /// Model name from the registry (default: qwen3-4b).
+        #[arg(long, default_value = "qwen3-4b")]
+        model: String,
+    },
+
+    /// Show the current daemon LLM configuration.
+    ConfigGetLlm,
+
+    /// Switch the daemon's LLM provider. Restart the daemon
+    /// (`pkill cm-daemon` then any cm command will auto-spawn) for
+    /// the change to take effect.
+    ConfigSetLlm {
+        /// Provider: local | openai | anthropic | none.
+        provider: String,
+        /// For provider=local: path to the GGUF file. Defaults to
+        /// the cached path written by `cm download-model`.
+        #[arg(long)]
+        model_path: Option<std::path::PathBuf>,
+        /// For provider=openai|anthropic: env var holding the API key.
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// For provider=openai|anthropic: model id.
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Local-only commands: model download + config edits. These don't
+    // need a daemon connection (the daemon reads its config at next
+    // startup), so handle them first and exit.
+    match &cli.command {
+        Command::DownloadModel { model } => {
+            return run_download_model(model).await;
+        }
+        Command::ConfigGetLlm => {
+            return run_config_get_llm();
+        }
+        Command::ConfigSetLlm {
+            provider,
+            model_path,
+            api_key_env,
+            model,
+        } => {
+            return run_config_set_llm(
+                provider,
+                model_path.as_deref(),
+                api_key_env.as_deref(),
+                model.as_deref(),
+            );
+        }
+        _ => {}
+    }
 
     let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
     let mut client = connect_or_spawn(&socket, &cli.user_id, !cli.no_spawn)
@@ -573,6 +630,13 @@ async fn run_command(client: &mut Client, cli: &Cli) -> Result<Response> {
                 ttl_seconds: *ttl_seconds,
             }))
         }
+
+        // These three are detoured at the top of `main` and never
+        // reach `run_command`. The arms exist only so the match is
+        // exhaustive; reaching them is a programming error.
+        Command::DownloadModel { .. } | Command::ConfigGetLlm | Command::ConfigSetLlm { .. } => {
+            unreachable!("local-only commands are handled in main() before daemon dispatch");
+        }
     };
 
     Ok(client.request(req).await?)
@@ -726,6 +790,132 @@ fn default_socket_path() -> PathBuf {
         .expect("data dir resolvable")
         .join("cognitive-memory")
         .join("cm.sock")
+}
+
+// ===========================================================================
+// Local-only commands: model download + config edits
+// ===========================================================================
+
+/// Where downloaded models live. Honours XDG via `dirs::cache_dir`.
+fn model_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .expect("cache dir resolvable")
+        .join("cognitive-memory")
+        .join("models")
+}
+
+/// Registry of named models the CLI knows how to download. Adding a
+/// new entry is the only thing required to ship a new local-LLM
+/// option through `cm download-model --model NAME`.
+fn model_registry(name: &str) -> Result<(&'static str, &'static str)> {
+    // (huggingface_url, on-disk filename)
+    match name {
+        "qwen3-4b" => Ok((
+            "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+            "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+        )),
+        "gemma-3-4b" => Ok((
+            "https://huggingface.co/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q4_K_M.gguf",
+            "gemma-3-4b-it-Q4_K_M.gguf",
+        )),
+        other => Err(anyhow::anyhow!(
+            "unknown model `{other}`; available: qwen3-4b, gemma-3-4b"
+        )),
+    }
+}
+
+#[allow(clippy::print_stdout)]
+async fn run_download_model(name: &str) -> Result<()> {
+    let (url, filename) = model_registry(name)?;
+    let target_dir = model_cache_dir();
+    std::fs::create_dir_all(&target_dir)
+        .with_context(|| format!("create {}", target_dir.display()))?;
+    let dest = target_dir.join(filename);
+    if dest.exists() {
+        println!("model already downloaded: {}", dest.display());
+        return Ok(());
+    }
+    println!("downloading {name} ({url})");
+    println!("  → {}", dest.display());
+
+    let resp = reqwest::get(url)
+        .await
+        .with_context(|| "fetch model GGUF")?
+        .error_for_status()
+        .with_context(|| "model download HTTP error")?;
+    let total = resp.content_length().unwrap_or(0);
+    if total > 0 {
+        println!("  size: {:.1} MB", total as f64 / 1_048_576.0);
+    }
+    let bytes = resp.bytes().await.with_context(|| "read model body")?;
+    std::fs::write(&dest, &bytes).with_context(|| format!("write {}", dest.display()))?;
+    println!("done: {} bytes written", bytes.len());
+
+    println!("\nnext step:");
+    println!("  cm config set-llm local --model-path {}", dest.display());
+    Ok(())
+}
+
+#[allow(clippy::print_stdout)]
+fn run_config_get_llm() -> Result<()> {
+    let cfg = cognitive_memory_core::DaemonConfig::load().with_context(|| "load daemon config")?;
+    match cfg.llm {
+        None => {
+            println!("no LLM configured (heuristic conflict resolution; consolidation skipped)")
+        }
+        Some(llm) => println!("{}", toml::to_string_pretty(&llm)?),
+    }
+    Ok(())
+}
+
+#[allow(clippy::print_stdout)]
+fn run_config_set_llm(
+    provider: &str,
+    model_path: Option<&std::path::Path>,
+    api_key_env: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
+    use cognitive_memory_core::LlmConfig;
+    let new_llm = match provider {
+        "none" => Some(LlmConfig::None),
+        "local" => {
+            let path = match model_path {
+                Some(p) => p.to_path_buf(),
+                None => {
+                    let default = model_cache_dir().join("Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+                    if !default.exists() {
+                        return Err(anyhow::anyhow!(
+                            "no --model-path specified and default {} not found; run `cm download-model` first",
+                            default.display()
+                        ));
+                    }
+                    default
+                }
+            };
+            Some(LlmConfig::Local { model_path: path })
+        }
+        "openai" => Some(LlmConfig::Openai {
+            api_key_env: api_key_env.unwrap_or("OPENAI_API_KEY").to_string(),
+            model: model.unwrap_or("gpt-4o-mini").to_string(),
+        }),
+        "anthropic" => Some(LlmConfig::Anthropic {
+            api_key_env: api_key_env.unwrap_or("ANTHROPIC_API_KEY").to_string(),
+            model: model.unwrap_or("claude-haiku-4-5-20251001").to_string(),
+        }),
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown provider `{other}`; expected one of: local, openai, anthropic, none"
+            ))
+        }
+    };
+    let cfg = cognitive_memory_core::DaemonConfig { llm: new_llm };
+    cfg.save().with_context(|| "save daemon config")?;
+    println!(
+        "saved config to {}",
+        cognitive_memory_core::config_path().display()
+    );
+    println!("restart the daemon for changes to take effect (`pkill cm-daemon`)");
+    Ok(())
 }
 
 /// Render a duration in seconds as `1d 2h 3m 4s`, dropping leading zero
