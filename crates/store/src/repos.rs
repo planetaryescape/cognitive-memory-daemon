@@ -408,6 +408,107 @@ impl<'a> MemoryRepo<'a> {
         Ok(q.execute(self.writer).await?.rows_affected())
     }
 
+    /// Apply direct-boost effects to a list of retrieved memories in
+    /// one transaction. Mirrors `_apply_direct_boost` in
+    /// `engine.py:148-160`. For each memory:
+    ///   - access_count += 1
+    ///   - last_accessed_at = now
+    ///   - stability = min(1.0, stability + boost)
+    ///   - session_ids: append `session_id` if provided and not present
+    ///
+    /// `boosts` is `(id, new_stability)` — the caller computes the
+    /// spaced-rep multiplier from each memory's `last_accessed_at`
+    /// since the formula needs per-memory dt.
+    pub async fn apply_direct_boost(
+        &self,
+        user_id: &str,
+        boosts: &[(String, f64)],
+        now: i64,
+        session_id: Option<&str>,
+    ) -> Result<u64, sqlx::Error> {
+        if boosts.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.writer.begin().await?;
+        let mut total = 0_u64;
+        for (id, new_stability) in boosts {
+            // Update stability + access counters + last_accessed_at.
+            let r = sqlx::query(
+                "UPDATE memories
+                 SET stability = ?,
+                     last_accessed_at = ?,
+                     retrieval_count = retrieval_count + 1
+                 WHERE user_id = ? AND id = ?",
+            )
+            .bind(new_stability)
+            .bind(now)
+            .bind(user_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            total += r.rows_affected();
+
+            // Append session_id to the JSON array if it's not already
+            // in there. SQLite has json_each / json_array_append in
+            // newer versions, but we keep this simple and read-modify-
+            // write the JSON in-process.
+            if let Some(sid) = session_id {
+                let row: Option<(String,)> =
+                    sqlx::query_as("SELECT session_ids FROM memories WHERE user_id = ? AND id = ?")
+                        .bind(user_id)
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                if let Some((current,)) = row {
+                    // session_ids is JSON array of strings.
+                    let mut sessions: Vec<String> =
+                        serde_json::from_str(&current).unwrap_or_default();
+                    if !sessions.iter().any(|s| s == sid) {
+                        sessions.push(sid.to_string());
+                        let new_json =
+                            serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string());
+                        sqlx::query(
+                            "UPDATE memories SET session_ids = ? WHERE user_id = ? AND id = ?",
+                        )
+                        .bind(new_json)
+                        .bind(user_id)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(total)
+    }
+
+    /// Promote memories to the `core` category atomically. Sets
+    /// `category = 'core'` and `retention_floor = 0.6`. Idempotent
+    /// (already-core memories are skipped at the SQL level by the
+    /// caller).
+    pub async fn promote_to_core(&self, user_id: &str, ids: &[String]) -> Result<u64, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.writer.begin().await?;
+        let mut total = 0_u64;
+        for id in ids {
+            let r = sqlx::query(
+                "UPDATE memories
+                 SET category = 'core', retention_floor = 0.6
+                 WHERE user_id = ? AND id = ? AND category != 'core'",
+            )
+            .bind(user_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            total += r.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(total)
+    }
+
     /// Apply a batch of `(id, retention_floor)` updates atomically.
     pub async fn update_retention_scores(
         &self,

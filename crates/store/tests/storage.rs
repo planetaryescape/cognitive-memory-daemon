@@ -58,7 +58,7 @@ async fn re_running_migrations_is_idempotent() {
     // After every migration in the engine has been applied, the row count
     // equals the number of declared migrations. Adding a migration bumps
     // this expectation in lockstep with the constant `MIGRATIONS` slice.
-    let expected_migrations = 3_i64;
+    let expected_migrations = 4_i64;
     assert_eq!(
         count_before.0, expected_migrations,
         "expected one row per declared migration"
@@ -205,7 +205,7 @@ async fn reopening_file_backed_store_does_not_duplicate_migration_rows() {
             .fetch_one(store.reader())
             .await
             .unwrap();
-        assert_eq!(count.0, 3, "v1 + v2 + v3 migrations applied");
+        assert_eq!(count.0, 4, "v1 + v2 + v3 + v4 migrations applied");
         // Drop the store; pools close.
     }
 
@@ -216,7 +216,7 @@ async fn reopening_file_backed_store_does_not_duplicate_migration_rows() {
         .await
         .unwrap();
     assert_eq!(
-        count_again.0, 3,
+        count_again.0, 4,
         "reopening must not duplicate migration rows"
     );
 }
@@ -285,7 +285,7 @@ fn migration_engine_is_idempotent_under_repeated_application() {
                         .fetch_one(store.reader())
                         .await
                         .unwrap();
-                    let expected = 3;
+                    let expected = 4;
                     if count.0 != expected {
                         return Err(proptest::test_runner::TestCaseError::fail(format!(
                             "expected {expected} migration rows, got {}",

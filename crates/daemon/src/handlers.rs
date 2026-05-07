@@ -229,10 +229,78 @@ async fn handle_memory_store(
     }
 
     MemoryRepo::new(&state.store).insert(&row).await?;
+
+    // Deferred conflict detection (paper §3.7, core.py:215-220):
+    // search for similar existing memories above the threshold and
+    // queue the pair. Resolved at the next tick. Uses the just-
+    // computed query vector and a small candidate radius.
+    queue_conflicts_for(state, &args.user_id, &id, &vector, now).await?;
+
     debug!(memory_id = %id, "memory stored");
     Ok(Response::ok(ResponseData::MemoryStored(MemoryStoredData {
         id,
     })))
+}
+
+/// Cosine threshold above which two memories are treated as
+/// conflict candidates (core.py:38: CONFLICT_SIMILARITY_THRESHOLD).
+const CONFLICT_SIMILARITY_THRESHOLD: f64 = 0.85;
+
+/// Detect probable conflicts for a freshly stored memory by running a
+/// vector search against existing memories. Pairs with similarity ≥
+/// CONFLICT_SIMILARITY_THRESHOLD are inserted into `conflict_queue`
+/// for the next tick to resolve.
+async fn queue_conflicts_for(
+    state: &Arc<AppState>,
+    user_id: &str,
+    new_id: &str,
+    new_vec: &[f32],
+    now: i64,
+) -> Result<(), HandlerError> {
+    let opts = SearchOptions {
+        limit: 5,
+        deep_recall: false,
+        provider: state.embeddings.name().to_string(),
+        model: state.embeddings.model().to_string(),
+        now,
+        hybrid: false,
+        query_text: None,
+        graph_expansion_hops: 0,
+        min_bridge_edge_weight: 0.3,
+        bridge_discovery: false,
+        max_bridge_paths: 3,
+    };
+    let hits = Searcher::new(&state.store)
+        .search(user_id, new_vec, &opts)
+        .await?;
+
+    let mut tx = state.store.writer().begin().await?;
+    for hit in hits {
+        if hit.memory_id == new_id {
+            continue;
+        }
+        // The composite score on the searcher is `cosine * R^α`; we
+        // need raw cosine. R is bounded above by 1.0, so when scores
+        // are above the threshold the cosine is too. (Stricter
+        // boundary is fine — fewer false-positive conflict pairs.)
+        if (hit.score as f64) < CONFLICT_SIMILARITY_THRESHOLD {
+            break; // results are sorted desc; below threshold = done
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO conflict_queue
+             (user_id, new_memory_id, existing_memory_id, similarity, queued_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(new_id)
+        .bind(&hit.memory_id)
+        .bind(hit.score as f64)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn handle_memory_store_batch(
@@ -341,6 +409,14 @@ async fn handle_memory_search(
     let anchor_ids: Vec<String> = results.iter().map(|r| r.memory_id.clone()).collect();
     let bridge_paths = searcher.find_bridges(&anchor_ids, &opts).await?;
 
+    // Read-side strengthening: apply spaced-repetition direct boost,
+    // record the session, and check core-promotion eligibility.
+    // Mirrors `_apply_direct_boost` (engine.py:148-160) and the
+    // post-retrieval core check (engine.py:615).
+    if !anchor_ids.is_empty() {
+        apply_post_retrieval_strengthening(state, &args.user_id, &anchor_ids, now).await?;
+    }
+
     let hits: Vec<SearchHit> = results
         .into_iter()
         .map(|r| SearchHit {
@@ -357,6 +433,65 @@ async fn handle_memory_search(
             bridge_paths,
         },
     )))
+}
+
+/// Apply direct-boost stability gain, refresh `last_accessed_at`,
+/// increment `retrieval_count`, append a new session id, and check
+/// each retrieved memory for core-promotion eligibility. Idempotent
+/// w.r.t. core (already-core memories aren't promoted twice).
+///
+/// Mirrors `engine.py:_apply_direct_boost` + `engine.py:615`. One
+/// call = one session id; all memories returned by a single search
+/// share that session.
+async fn apply_post_retrieval_strengthening(
+    state: &Arc<AppState>,
+    user_id: &str,
+    retrieved_ids: &[String],
+    now: i64,
+) -> Result<(), HandlerError> {
+    let mem_repo = MemoryRepo::new(&state.store);
+    let rows = mem_repo.get_many_for_user(user_id, retrieved_ids).await?;
+
+    let cfg = lifecycle_config();
+    let mut boosts: Vec<(String, f64)> = Vec::with_capacity(rows.len());
+    let mut promotions: Vec<String> = Vec::new();
+
+    for row in &rows {
+        if row.is_stub {
+            continue;
+        }
+        let dt_days = ((now - row.last_accessed_at).max(0) as f64) / 86_400.0;
+        let factor = (dt_days / cfg.spaced_rep_interval_days).min(cfg.max_spaced_rep_multiplier);
+        let new_stability = (row.stability + cfg.direct_boost * factor).min(1.0);
+        boosts.push((row.id.clone(), new_stability));
+
+        // Core-promotion gate uses post-boost stability, post-increment
+        // access count, and the session-set length (after the new
+        // session id is appended).
+        if row.category != "core" {
+            let post_access = row.retrieval_count + 1;
+            let mut sessions: Vec<String> =
+                serde_json::from_str(&row.session_ids).unwrap_or_default();
+            if !sessions.contains(&"__pending__".to_string()) {
+                sessions.push("__pending__".to_string());
+            }
+            if post_access >= cfg.core_access_threshold as i64
+                && new_stability >= cfg.core_stability_threshold
+                && sessions.len() >= cfg.core_session_threshold
+            {
+                promotions.push(row.id.clone());
+            }
+        }
+    }
+
+    let session_id = format!("s_{}", ulid::Ulid::new());
+    mem_repo
+        .apply_direct_boost(user_id, &boosts, now, Some(&session_id))
+        .await?;
+    if !promotions.is_empty() {
+        mem_repo.promote_to_core(user_id, &promotions).await?;
+    }
+    Ok(())
 }
 
 async fn handle_memory_get(
@@ -674,47 +809,204 @@ async fn handle_lifecycle_request(
     }
 }
 
-async fn handle_tick(_args: TickArgs, state: &Arc<AppState>) -> Result<Response, HandlerError> {
-    // Walk every hot non-stub memory; compute its current retention; if
-    // retention has flatlined at the floor, increment `days_at_floor`,
-    // otherwise reset it to 0. `memories_decayed` reports the count
-    // currently at floor.
-    //
-    // This is the consolidation pass — it does not advance wall-clock
-    // time; decay is read-side. `days_at_floor` is what later passes use
-    // to decide cold-migration candidacy.
-    let now = unix_now();
-    let rows: Vec<MemoryRow> =
-        sqlx::query_as("SELECT * FROM memories WHERE is_cold = 0 AND is_stub = 0")
-            .fetch_all(state.store.reader())
-            .await?;
+/// Days at floor before a non-core memory is auto-migrated to cold.
+/// Mirrors `cold_migration_days = 7` in the Python SDK.
+const COLD_MIGRATION_DAYS: i64 = 7;
 
+/// Days a memory may live in cold storage before being converted to a
+/// retrieval-stub and dropped. Mirrors `cold_storage_ttl_days = 180`.
+const COLD_TTL_DAYS: i64 = 180;
+
+/// Cap on how many queued conflicts a single tick will resolve.
+const CONFLICT_RESOLUTION_BATCH: i64 = 50;
+
+async fn handle_tick(_args: TickArgs, state: &Arc<AppState>) -> Result<Response, HandlerError> {
+    // The SDK's `tick()` pipeline runs four passes in order
+    // (engine.py:810-819 + core.py:tick line 371-378):
+    //   1. days_at_floor counter + cold migration
+    //   2. cold TTL expiry (cold_since older than 180d → stub)
+    //   3. conflict-queue resolution (≤50/tick; LLM-judge in SDK,
+    //      heuristic here pending an LLM provider in AppState)
+    //   4. consolidation clustering (LLM compression — Phase 11+)
+    //
+    // `memories_decayed` is the legacy v0 counter; we keep it but
+    // also track migrated/expired/resolved separately for the trace.
+    let now = unix_now();
     let mut decayed: u64 = 0;
+
+    // -------- Pass 1: counter + cold migration --------
+    let hot_rows: Vec<MemoryRow> = sqlx::query_as(
+        "SELECT * FROM memories WHERE is_cold = 0 AND is_stub = 0 AND is_superseded = 0",
+    )
+    .fetch_all(state.store.reader())
+    .await?;
+
     let mut tx = state.store.writer().begin().await?;
-    for row in rows {
+    let mut migrated_to_cold = 0u64;
+    for row in hot_rows {
         let retention = compute_current_retention(&row, now);
-        // "At floor" means the computed retention has clamped to the
-        // stored floor. Use a small epsilon for f64 comparison.
         let at_floor = (retention - row.retention_floor).abs() < 1e-9 && row.retention_floor > 0.0;
-        if at_floor {
+        let new_days_at_floor = if at_floor {
             sqlx::query("UPDATE memories SET days_at_floor = days_at_floor + 1 WHERE id = ?")
                 .bind(&row.id)
                 .execute(&mut *tx)
                 .await?;
             decayed += 1;
-        } else if row.days_at_floor > 0 {
-            sqlx::query("UPDATE memories SET days_at_floor = 0 WHERE id = ?")
+            row.days_at_floor + 1
+        } else {
+            if row.days_at_floor > 0 {
+                sqlx::query("UPDATE memories SET days_at_floor = 0 WHERE id = ?")
+                    .bind(&row.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            0
+        };
+
+        // Cold-migrate non-core memories that have been at floor long
+        // enough. Core memories are exempt (engine.py:665-666).
+        if row.category != "core" && new_days_at_floor >= COLD_MIGRATION_DAYS {
+            sqlx::query("UPDATE memories SET is_cold = 1, cold_since = ? WHERE id = ?")
+                .bind(now)
                 .bind(&row.id)
                 .execute(&mut *tx)
                 .await?;
+            migrated_to_cold += 1;
         }
     }
     tx.commit().await?;
+
+    // -------- Pass 2: cold TTL expiry → stub --------
+    let stale_cold: Vec<MemoryRow> = sqlx::query_as(
+        "SELECT * FROM memories
+         WHERE is_cold = 1 AND is_stub = 0 AND cold_since IS NOT NULL
+           AND cold_since < ?",
+    )
+    .bind(now - COLD_TTL_DAYS * 86_400)
+    .fetch_all(state.store.reader())
+    .await?;
+
+    let mut tx = state.store.writer().begin().await?;
+    let mut expired_to_stub = 0u64;
+    for row in stale_cold {
+        if row.category == "core" {
+            continue;
+        }
+        let preview: String = row.content.chars().take(200).collect();
+        let stub = format!("[archived] {preview}");
+        sqlx::query(
+            "UPDATE memories SET is_stub = 1, stub_content = ?, embedding = NULL WHERE id = ?",
+        )
+        .bind(&stub)
+        .bind(&row.id)
+        .execute(&mut *tx)
+        .await?;
+        expired_to_stub += 1;
+    }
+    tx.commit().await?;
+
+    // -------- Pass 3: conflict resolution --------
+    let resolved = resolve_conflicts(state, now).await?;
+
+    tracing::debug!(
+        decayed,
+        migrated_to_cold,
+        expired_to_stub,
+        resolved,
+        "tick complete"
+    );
 
     Ok(Response::ok(ResponseData::Tick(TickResultData {
         completed: true,
         memories_decayed: decayed,
     })))
+}
+
+/// Drain up to `CONFLICT_RESOLUTION_BATCH` conflict pairs from the
+/// queue. For each, apply a heuristic resolver (the loser is
+/// superseded by the winner). Mirrors `_resolve_conflict_queue`
+/// (core.py:380-432) but uses an importance/recency heuristic
+/// instead of an LLM judge — the daemon may not have an LLM
+/// provider configured.
+///
+/// Heuristic: winner = (higher importance) ⇒ tie ⇒ (more recent
+/// `created_at`). Loser is marked `is_superseded=1`,
+/// `superseded_by=winner_id`, `contradicted_by=winner_id`.
+async fn resolve_conflicts(state: &Arc<AppState>, now: i64) -> Result<u64, HandlerError> {
+    let pairs: Vec<(i64, String, String, String)> = sqlx::query_as(
+        "SELECT id, user_id, new_memory_id, existing_memory_id
+         FROM conflict_queue
+         ORDER BY similarity DESC LIMIT ?",
+    )
+    .bind(CONFLICT_RESOLUTION_BATCH)
+    .fetch_all(state.store.reader())
+    .await?;
+
+    if pairs.is_empty() {
+        return Ok(0);
+    }
+
+    let _ = now;
+    let mut resolved = 0u64;
+    let mut tx = state.store.writer().begin().await?;
+    for (queue_id, user_id, new_id, existing_id) in pairs {
+        // Re-fetch both rows; either may have been deleted/superseded
+        // in the meantime.
+        let new_row: Option<MemoryRow> =
+            sqlx::query_as("SELECT * FROM memories WHERE user_id = ? AND id = ?")
+                .bind(&user_id)
+                .bind(&new_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let existing_row: Option<MemoryRow> =
+            sqlx::query_as("SELECT * FROM memories WHERE user_id = ? AND id = ?")
+                .bind(&user_id)
+                .bind(&existing_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        // If either is gone or already-superseded, drop the queue
+        // entry and move on.
+        if let (Some(n), Some(e)) = (new_row, existing_row) {
+            if !n.is_superseded && !e.is_superseded {
+                let (winner, loser) = if n.importance > e.importance
+                    || (n.importance == e.importance && n.created_at > e.created_at)
+                {
+                    (n, e)
+                } else {
+                    (e, n)
+                };
+                sqlx::query(
+                    "UPDATE memories
+                     SET is_superseded = 1, superseded_by = ?, contradicted_by = ?
+                     WHERE id = ?",
+                )
+                .bind(&winner.id)
+                .bind(&winner.id)
+                .bind(&loser.id)
+                .execute(&mut *tx)
+                .await?;
+                // Demote a CORE loser back to semantic (engine.py:418-419).
+                if loser.category == "core" {
+                    sqlx::query(
+                        "UPDATE memories SET category = 'semantic', retention_floor = 0.0
+                         WHERE id = ?",
+                    )
+                    .bind(&loser.id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                resolved += 1;
+            }
+        }
+
+        sqlx::query("DELETE FROM conflict_queue WHERE id = ?")
+            .bind(queue_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(resolved)
 }
 
 async fn handle_find_fading(

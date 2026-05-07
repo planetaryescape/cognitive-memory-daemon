@@ -262,6 +262,23 @@ CREATE INDEX idx_memories_user_stub ON memories(user_id, is_stub);
 CREATE INDEX idx_memories_user_superseded ON memories(user_id, is_superseded);
 "#;
 
+/// Conflict queue: pairs of memories whose embeddings collided at
+/// ingest above the `CONFLICT_SIMILARITY_THRESHOLD`. Resolved at tick.
+/// Mirrors `_conflict_queue` in `core.py:215-220`.
+const MIGRATION_V4_CONFLICT_QUEUE: &str = r#"
+CREATE TABLE conflict_queue (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT NOT NULL,
+    new_memory_id   TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    existing_memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    similarity      REAL NOT NULL,
+    queued_at       INTEGER NOT NULL,
+    UNIQUE (user_id, new_memory_id, existing_memory_id)
+);
+
+CREATE INDEX idx_conflict_queue_user ON conflict_queue(user_id, queued_at);
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -277,5 +294,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "full_memory_fields",
         sql: MIGRATION_V3_FULL_MEMORY_FIELDS,
+    },
+    Migration {
+        version: 4,
+        name: "conflict_queue",
+        sql: MIGRATION_V4_CONFLICT_QUEUE,
     },
 ];
