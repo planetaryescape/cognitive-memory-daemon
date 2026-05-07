@@ -605,8 +605,12 @@ impl<'a> MemoryRepo<'a> {
     }
 
     pub async fn migrate_to_hot(&self, user_id: &str, id: &str) -> Result<bool, sqlx::Error> {
+        // Reset all three cold-state fields, mirroring SDK adapter
+        // contract (base.py:116). days_at_floor must zero too — a
+        // restored memory starts the at-floor counter fresh.
         let r = sqlx::query(
-            "UPDATE memories SET is_cold = 0, cold_since = NULL
+            "UPDATE memories
+             SET is_cold = 0, cold_since = NULL, days_at_floor = 0
              WHERE user_id = ? AND id = ?",
         )
         .bind(user_id)
@@ -614,6 +618,35 @@ impl<'a> MemoryRepo<'a> {
         .execute(self.writer)
         .await?;
         Ok(r.rows_affected() > 0)
+    }
+
+    /// Bulk variant: restore many memories from cold in one tx.
+    /// Used by the search/get auto-restore paths so a single read
+    /// touching multiple cold rows doesn't deadlock the writer pool.
+    pub async fn migrate_to_hot_many(
+        &self,
+        user_id: &str,
+        ids: &[String],
+    ) -> Result<u64, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.writer.begin().await?;
+        let mut total = 0u64;
+        for id in ids {
+            let r = sqlx::query(
+                "UPDATE memories
+                 SET is_cold = 0, cold_since = NULL, days_at_floor = 0
+                 WHERE user_id = ? AND id = ?",
+            )
+            .bind(user_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            total += r.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(total)
     }
 
     pub async fn convert_to_stub(
@@ -742,11 +775,11 @@ impl<'a> MemoryRepo<'a> {
         include_expired: bool,
     ) -> Result<Vec<SearchCandidate>, sqlx::Error> {
         // `include_expired` is the daemon's `deep_recall` mode. Per SDK
-        // parity (engine.py: `include_superseded = deep_recall`) it
-        // also drops the `is_superseded = 0` filter so superseded
-        // memories surface for audit-style retrieval. Stubs stay
-        // hidden in both modes — searchable stubs would defeat their
-        // archival purpose.
+        // parity (engine.py: `include_superseded = deep_recall` AND
+        // `include_cold = deep_recall`) it drops three filters:
+        // `is_superseded = 0`, `is_cold = 0`, and `valid_until > now`.
+        // Stubs stay hidden in both modes — searchable stubs would
+        // defeat their archival purpose.
         let sql = if include_expired {
             "SELECT id, content, embedding, category, memory_type, last_accessed_at,
                     created_at, retention_floor, retrieval_count,
@@ -763,7 +796,7 @@ impl<'a> MemoryRepo<'a> {
              FROM memories
              WHERE user_id = ? AND embedding IS NOT NULL
                AND embedding_provider = ? AND embedding_model = ?
-               AND is_stub = 0 AND is_superseded = 0
+               AND is_stub = 0 AND is_superseded = 0 AND is_cold = 0
                AND (valid_from IS NULL OR valid_from <= ?)
                AND (valid_until IS NULL OR valid_until > ?)"
         };

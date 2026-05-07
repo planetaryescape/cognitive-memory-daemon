@@ -100,6 +100,40 @@ async fn pragmas_wal_and_foreign_keys_are_enabled() {
     assert_eq!(fk_on, 1, "foreign_keys must be ON");
 }
 
+/// `MemoryRepo::migrate_to_hot_many` resets all three cold-state
+/// fields atomically: is_cold→0, cold_since→NULL, days_at_floor→0.
+/// Mirrors the SDK adapter contract (base.py:116) — any access that
+/// surfaces a cold memory must restore it on all three dimensions.
+#[tokio::test]
+async fn migrate_to_hot_many_resets_is_cold_cold_since_and_days_at_floor() {
+    use cognitive_memory_store::{MemoryRepo, MemoryRow};
+
+    let store = Store::in_memory().await.unwrap();
+    let repo = MemoryRepo::new(&store);
+
+    // Plant two cold memories with non-zero days_at_floor.
+    for id in ["cold_a", "cold_b"] {
+        let mut row = MemoryRow::new_minimal(id, "alice", "x", "semantic", "fact", 100);
+        row.is_cold = true;
+        row.cold_since = Some(50);
+        row.days_at_floor = 9;
+        repo.insert(&row).await.unwrap();
+    }
+
+    let n = repo
+        .migrate_to_hot_many("alice", &["cold_a".to_string(), "cold_b".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(n, 2, "two rows must be migrated");
+
+    for id in ["cold_a", "cold_b"] {
+        let row = repo.get_for_user("alice", id).await.unwrap().unwrap();
+        assert!(!row.is_cold, "{id} is_cold must be false");
+        assert!(row.cold_since.is_none(), "{id} cold_since must be NULL");
+        assert_eq!(row.days_at_floor, 0, "{id} days_at_floor must reset to 0");
+    }
+}
+
 /// `AssociationRepo::strengthen_pairs` UPSERTs bidirectional weights
 /// in one transaction. Mirrors SDK engine.py:621-625 + core.py:258-262.
 /// Pre-existing edge weight 0.4 + bump 0.1 → 0.5; new edges → 0.1.

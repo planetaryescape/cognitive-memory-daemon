@@ -487,6 +487,26 @@ async fn handle_memory_search(
     let anchor_ids: Vec<String> = results.iter().map(|r| r.memory_id.clone()).collect();
     let bridge_paths = searcher.find_bridges(&anchor_ids, &opts).await?;
 
+    // Cold-store auto-restore on access (engine.py:606,612):
+    // any cold memory that surfaces in deep_recall search is
+    // migrated back to hot. Stage 3 e2e validates this path.
+    if args.deep_recall && !anchor_ids.is_empty() {
+        let mem_repo = MemoryRepo::new(&state.store);
+        let rows = mem_repo
+            .get_many_for_user(&args.user_id, &anchor_ids)
+            .await?;
+        let cold_ids: Vec<String> = rows
+            .into_iter()
+            .filter(|r| r.is_cold)
+            .map(|r| r.id)
+            .collect();
+        if !cold_ids.is_empty() {
+            mem_repo
+                .migrate_to_hot_many(&args.user_id, &cold_ids)
+                .await?;
+        }
+    }
+
     // Read-side strengthening: apply spaced-repetition direct boost
     // (Eq 6) for direct hits or associative boost (Eq 8) for graph-
     // expanded hits, refresh last_accessed_at, record the session,
@@ -615,10 +635,21 @@ async fn handle_memory_get(
     connection_user: &str,
 ) -> Result<Response, HandlerError> {
     require_user_match(&args.user_id, connection_user)?;
-    let row = MemoryRepo::new(&state.store)
+    let repo = MemoryRepo::new(&state.store);
+    let mut row = repo
         .get_for_user(&args.user_id, &args.id)
         .await?
         .ok_or(HandlerError::NotFound)?;
+    // Cold-store auto-restore on access (engine.py:606,612).
+    // Any access surfaces a cold memory and migrates it back to hot.
+    // The response reflects the post-restore state.
+    if row.is_cold {
+        repo.migrate_to_hot_many(&args.user_id, &[row.id.clone()])
+            .await?;
+        row.is_cold = false;
+        row.cold_since = None;
+        row.days_at_floor = 0;
+    }
     Ok(Response::ok(ResponseData::Memory(memory_row_to_data(row))))
 }
 
@@ -628,9 +659,22 @@ async fn handle_memory_get_many(
     connection_user: &str,
 ) -> Result<Response, HandlerError> {
     require_user_match(&args.user_id, connection_user)?;
-    let rows = MemoryRepo::new(&state.store)
-        .get_many_for_user(&args.user_id, &args.ids)
-        .await?;
+    let repo = MemoryRepo::new(&state.store);
+    let mut rows = repo.get_many_for_user(&args.user_id, &args.ids).await?;
+    // Bulk auto-restore for any cold rows in the result set.
+    let cold_ids: Vec<String> = rows
+        .iter()
+        .filter(|r| r.is_cold)
+        .map(|r| r.id.clone())
+        .collect();
+    if !cold_ids.is_empty() {
+        repo.migrate_to_hot_many(&args.user_id, &cold_ids).await?;
+        for row in rows.iter_mut().filter(|r| r.is_cold) {
+            row.is_cold = false;
+            row.cold_since = None;
+            row.days_at_floor = 0;
+        }
+    }
     Ok(Response::ok(ResponseData::Memories(MemoriesData {
         memories: rows.into_iter().map(memory_row_to_data).collect(),
     })))

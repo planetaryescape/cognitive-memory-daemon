@@ -1321,6 +1321,188 @@ async fn search_applies_smaller_boost_to_graph_expanded_results() {
     let _ = handle.await;
 }
 
+/// `cm get <cold_id>` returns the memory AND auto-restores it to hot.
+/// Mirrors SDK engine.py:606,612. Subsequent `cm get` confirms.
+#[tokio::test]
+async fn get_auto_restores_cold_memory_to_hot() {
+    let (handle, socket, shutdown, _tmp) = boot_daemon().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let id = store_helper(
+        &mut client,
+        "memory will go cold then get accessed",
+        "semantic",
+    )
+    .await;
+    // Manually migrate to cold via the IPC op.
+    use cognitive_memory_protocol::MigrateToColdArgs;
+    client
+        .request(Request::Lifecycle(LifecycleRequest::MigrateToCold(
+            MigrateToColdArgs {
+                user_id: "alice".to_string(),
+                id: id.clone(),
+                cold_since: 100,
+            },
+        )))
+        .await
+        .unwrap();
+
+    // Pre-condition: is_cold is true.
+    let before = fetch(&mut client, &id).await;
+    assert!(
+        !before.is_cold,
+        "after `cm get`, is_cold should already be false (auto-restore on first read)"
+    );
+
+    // After a follow-up read, still hot.
+    let after = fetch(&mut client, &id).await;
+    assert!(!after.is_cold);
+    assert_eq!(after.days_at_floor, 0);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// `cm search --deep-recall` surfaces cold memories AND auto-restores
+/// them. Default search (no --deep-recall) does not surface cold.
+///
+/// Reads `is_cold` via direct SQL (not `cm get`) because the get
+/// handler also auto-restores — using IPC would poison the
+/// "default search did not restore" check.
+#[tokio::test]
+async fn deep_recall_search_surfaces_and_restores_cold_memory() {
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_embeddings().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let mut v = vec![0.0f32; 16];
+    v[0] = 1.0;
+    embeddings.set_override("cold restore search target", v.clone());
+    embeddings.set_override("cold restore query", v);
+
+    let id = store_helper(&mut client, "cold restore search target", "semantic").await;
+    use cognitive_memory_protocol::MigrateToColdArgs;
+    client
+        .request(Request::Lifecycle(LifecycleRequest::MigrateToCold(
+            MigrateToColdArgs {
+                user_id: "alice".to_string(),
+                id: id.clone(),
+                cold_since: 100,
+            },
+        )))
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+
+    async fn read_is_cold(store: &Store, id: &str) -> bool {
+        let row: (i64,) = sqlx::query_as("SELECT is_cold FROM memories WHERE id = ?")
+            .bind(id)
+            .fetch_one(store.reader())
+            .await
+            .unwrap();
+        row.0 != 0
+    }
+
+    assert!(read_is_cold(&store, &id).await, "pre-condition: cold");
+
+    // Default search: must NOT surface cold memory and must NOT restore.
+    let default_resp = client
+        .request(Request::Memory(MemoryRequest::Search(SearchMemoryArgs {
+            user_id: "alice".to_string(),
+            query: "cold restore query".to_string(),
+            limit: 5,
+            deep_recall: false,
+            hybrid: false,
+            graph_expansion_hops: 0,
+            bridge_discovery: false,
+        })))
+        .await
+        .unwrap();
+    let default_ids: Vec<String> = match default_resp.data.unwrap() {
+        ResponseData::MemorySearchResults(r) => {
+            r.results.into_iter().map(|h| h.memory_id).collect()
+        }
+        _ => panic!("expected MemorySearchResults"),
+    };
+    assert!(
+        !default_ids.contains(&id),
+        "default search must NOT surface cold memory; got {default_ids:?}"
+    );
+    assert!(
+        read_is_cold(&store, &id).await,
+        "default search must not auto-restore"
+    );
+
+    // Deep-recall: surfaces AND restores.
+    let deep_resp = client
+        .request(Request::Memory(MemoryRequest::Search(SearchMemoryArgs {
+            user_id: "alice".to_string(),
+            query: "cold restore query".to_string(),
+            limit: 5,
+            deep_recall: true,
+            hybrid: false,
+            graph_expansion_hops: 0,
+            bridge_discovery: false,
+        })))
+        .await
+        .unwrap();
+    let deep_ids: Vec<String> = match deep_resp.data.unwrap() {
+        ResponseData::MemorySearchResults(r) => {
+            r.results.into_iter().map(|h| h.memory_id).collect()
+        }
+        _ => panic!("expected MemorySearchResults"),
+    };
+    assert!(
+        deep_ids.contains(&id),
+        "deep_recall search must surface cold memory; got {deep_ids:?}"
+    );
+    assert!(
+        !read_is_cold(&store, &id).await,
+        "deep_recall surfaced cold must auto-restore"
+    );
+    drop(store);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Restoring from cold also resets days_at_floor (set non-zero by
+/// the at-floor counter prior to migration).
+#[tokio::test]
+async fn restore_resets_days_at_floor_alongside_is_cold() {
+    let (handle, socket, shutdown, tmp) = boot_daemon().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let id = store_helper(&mut client, "had non-zero days_at_floor", "semantic").await;
+    // Plant: is_cold=1, cold_since=100, days_at_floor=9.
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    sqlx::query(
+        "UPDATE memories
+         SET is_cold = 1, cold_since = 100, days_at_floor = 9
+         WHERE id = ?",
+    )
+    .bind(&id)
+    .execute(store.writer())
+    .await
+    .unwrap();
+    drop(store);
+
+    // Access via `cm get` triggers restore.
+    let m = fetch(&mut client, &id).await;
+    assert!(!m.is_cold);
+    assert!(m.cold_since.is_none());
+    assert_eq!(m.days_at_floor, 0, "all three cold-state fields reset");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// Status uptime must reflect actual elapsed time, not the bug at
 /// 0.0.1 release where the field was hardcoded to 0.
 #[tokio::test]
