@@ -84,6 +84,56 @@ async fn boot_daemon_full(
         embeddings.clone();
     let daemon = Daemon::new_with_llm(store, embeddings_for_daemon, socket_path.clone(), llm);
     let shutdown = daemon.shutdown_handle();
+    boot_daemon_serve(daemon, socket_path, shutdown, tmp, embeddings).await
+}
+
+/// Variant that wires an explicit `LifecycleConfig` into the daemon —
+/// used by the Phase 0a-daemon override-propagation tests below.
+/// Returns the same handle quintuple plus the temp dir's path so the
+/// test can open the SQLite directly to backdate memories.
+async fn boot_daemon_with_lifecycle(
+    lifecycle: cognitive_memory_lifecycle::LifecycleConfig,
+) -> (
+    tokio::task::JoinHandle<()>,
+    PathBuf,
+    tokio::sync::broadcast::Sender<()>,
+    TempDir,
+    Arc<FakeEmbeddingProvider>,
+    PathBuf,
+) {
+    let tmp = TempDir::new().unwrap();
+    let socket_path = tmp.path().join("cm.sock");
+    let db_path = tmp.path().join("data.db");
+    let store = Store::open(&db_path).await.unwrap();
+    let embeddings = Arc::new(FakeEmbeddingProvider::new("local", "fake-16", 16));
+    let embeddings_for_daemon: Arc<dyn cognitive_memory_embeddings::EmbeddingProvider> =
+        embeddings.clone();
+    let daemon = Daemon::new_full(
+        store,
+        embeddings_for_daemon,
+        socket_path.clone(),
+        None,
+        lifecycle,
+    );
+    let shutdown = daemon.shutdown_handle();
+    let (handle, socket_path, shutdown, tmp, embeddings) =
+        boot_daemon_serve(daemon, socket_path, shutdown, tmp, embeddings).await;
+    (handle, socket_path, shutdown, tmp, embeddings, db_path)
+}
+
+async fn boot_daemon_serve(
+    daemon: Daemon,
+    socket_path: PathBuf,
+    shutdown: tokio::sync::broadcast::Sender<()>,
+    tmp: TempDir,
+    embeddings: Arc<FakeEmbeddingProvider>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    PathBuf,
+    tokio::sync::broadcast::Sender<()>,
+    TempDir,
+    Arc<FakeEmbeddingProvider>,
+) {
 
     let handle = tokio::spawn(async move {
         daemon.serve().await.expect("daemon serve");
@@ -2599,4 +2649,147 @@ async fn stub_returns_retention_zero_regardless_of_age() {
 
     let _ = shutdown.send(());
     let _ = handle.await;
+}
+
+// =========================================================================
+// Phase 0a-daemon — `[lifecycle]` override propagation through the IPC path.
+//
+// The Stage 0a-daemon plan (~/.claude/plans/now-create-a-plan-validated-yao.md)
+// calls for an e2e test that "writes a config.toml with `[lifecycle]`
+// override, restarts daemon, verifies a stored memory's `current_retention`
+// reflects the new β." This is that test, structured a level below
+// config.toml — it constructs the same `LifecycleConfig` that
+// `main.rs::build_lifecycle_config()` would produce after merging
+// the TOML overrides, and threads it through `Daemon::new_full`. The
+// TOML parse step is covered by `crates/core/src/config.rs` unit tests
+// (4 tests on `[lifecycle.base_decay_rates]` parse + roundtrip).
+// =========================================================================
+
+/// Helper: store a semantic memory via IPC, backdate its `last_accessed_at`
+/// directly via SQLite, then re-fetch via IPC. Returns the
+/// `current_retention` the daemon computed.
+///
+/// `age_days` controls how far back the access timestamp is set so the
+/// retention formula returns a value < 1.0 that's sensitive to β.
+async fn store_backdate_get_retention(
+    socket: &PathBuf,
+    db_path: &PathBuf,
+    age_days: i64,
+) -> f64 {
+    let mut client = Client::connect(socket, "test-client", "alice")
+        .await
+        .unwrap();
+    let stored = client
+        .request(Request::Memory(MemoryRequest::Store(StoreMemoryArgs {
+            user_id: "alice".to_string(),
+            content: "the user's favourite colour is blue".to_string(),
+            category: "semantic".to_string(),
+            memory_type: "fact".to_string(),
+            metadata: "{}".to_string(),
+            // importance=Some(0.0) keeps boost factor B=1.0 so retention
+            // is purely β-driven (no importance multiplier confound).
+            importance: Some(0.0),
+        })))
+        .await
+        .unwrap();
+    let id = match stored.data.unwrap() {
+        ResponseData::MemoryStored(m) => m.id,
+        other => panic!("expected MemoryStored on Store, got {other:?}"),
+    };
+
+    // Backdate via direct SQLite write so retention has time to decay.
+    // The daemon doesn't refuse concurrent reader access (WAL mode);
+    // dropping our store handle before the next IPC call avoids any
+    // writer contention.
+    let store = Store::open(db_path).await.unwrap();
+    let backdate_secs = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - age_days * 86_400;
+    sqlx::query("UPDATE memories SET last_accessed_at = ? WHERE id = ?")
+        .bind(backdate_secs)
+        .bind(&id)
+        .execute(store.writer())
+        .await
+        .unwrap();
+    drop(store);
+
+    let resp = client
+        .request(Request::Memory(MemoryRequest::Get(GetMemoryArgs {
+            user_id: "alice".to_string(),
+            id,
+        })))
+        .await
+        .unwrap();
+    match resp.data.unwrap() {
+        ResponseData::Memory(m) => m.current_retention,
+        other => panic!("expected Memory on Get, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_override_changes_current_retention_through_ipc() {
+    // Two daemons, identical except for `LifecycleConfig.base_decay_rates`:
+    //   - paper: semantic β = 120d (Table 2 default)
+    //   - fast:  semantic β =  60d (override; halved)
+    // Same memory shape (semantic, importance=0, stability default), same
+    // 90-day backdate. Faster β should drop retention further → r_fast <
+    // r_paper. This is the contract config.toml [lifecycle] is supposed
+    // to deliver to operators tuning the daemon.
+    use cognitive_memory_lifecycle::LifecycleConfig;
+
+    let mut fast_cfg = cognitive_memory_daemon::paper_faithful_lifecycle_config();
+    fast_cfg
+        .base_decay_rates
+        .insert("semantic".to_string(), 60.0);
+
+    let paper_cfg: LifecycleConfig = cognitive_memory_daemon::paper_faithful_lifecycle_config();
+
+    // Boot both daemons. Each gets its own tempdir, socket, store.
+    let (h1, sock1, sh1, _tmp1, _emb1, db1) =
+        boot_daemon_with_lifecycle(paper_cfg).await;
+    let (h2, sock2, sh2, _tmp2, _emb2, db2) =
+        boot_daemon_with_lifecycle(fast_cfg).await;
+
+    let r_paper = store_backdate_get_retention(&sock1, &db1, 90).await;
+    let r_fast = store_backdate_get_retention(&sock2, &db2, 90).await;
+
+    let _ = sh1.send(());
+    let _ = sh2.send(());
+    let _ = h1.await;
+    let _ = h2.await;
+
+    // Strict inequality is the contract: halving β doubles the effective
+    // decay rate, so 90-day retention must be lower under the override.
+    assert!(
+        r_fast < r_paper,
+        "override didn't change retention: r_paper={r_paper}, r_fast={r_fast}"
+    );
+    // Sanity: both must still be in [0, 1] (no NaN, no above-floor weirdness).
+    assert!(r_paper > 0.0 && r_paper <= 1.0, "r_paper out of range: {r_paper}");
+    assert!(r_fast > 0.0 && r_fast <= 1.0, "r_fast out of range: {r_fast}");
+}
+
+#[tokio::test]
+async fn paper_faithful_default_matches_table_2_through_ipc() {
+    // Sibling test: confirm the daemon's `paper_faithful_lifecycle_config()`
+    // produces a retention that matches the hand-computed paper formula
+    // for a known memory shape. Catches accidental drift from Table 2
+    // defaults during refactors.
+    let cfg = cognitive_memory_daemon::paper_faithful_lifecycle_config();
+    assert!(
+        (cfg.beta_for("semantic") - 120.0).abs() < 1e-9,
+        "paper default β_semantic must be 120d, got {}",
+        cfg.beta_for("semantic")
+    );
+    assert!(
+        (cfg.beta_for("episodic") - 45.0).abs() < 1e-9,
+        "paper default β_episodic must be 45d, got {}",
+        cfg.beta_for("episodic")
+    );
+    assert!(
+        cfg.beta_for("procedural").is_infinite(),
+        "paper default β_procedural must be ∞ (no decay)"
+    );
 }
