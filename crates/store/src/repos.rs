@@ -607,13 +607,19 @@ impl<'a> MemoryRepo<'a> {
         now: i64,
         include_expired: bool,
     ) -> Result<Vec<SearchCandidate>, sqlx::Error> {
+        // `include_expired` is the daemon's `deep_recall` mode. Per SDK
+        // parity (engine.py: `include_superseded = deep_recall`) it
+        // also drops the `is_superseded = 0` filter so superseded
+        // memories surface for audit-style retrieval. Stubs stay
+        // hidden in both modes — searchable stubs would defeat their
+        // archival purpose.
         let sql = if include_expired {
             "SELECT id, content, embedding, category, memory_type, last_accessed_at,
                     retention_floor, retrieval_count
              FROM memories
              WHERE user_id = ? AND embedding IS NOT NULL
                AND embedding_provider = ? AND embedding_model = ?
-               AND is_stub = 0 AND is_superseded = 0
+               AND is_stub = 0
                AND (valid_from IS NULL OR valid_from <= ?)"
         } else {
             "SELECT id, content, embedding, category, memory_type, last_accessed_at,
