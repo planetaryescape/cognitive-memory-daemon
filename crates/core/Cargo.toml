@@ -1,0 +1,16 @@
+[package]
+name = "cognitive-memory-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared types and traits for cognitive-memory-daemon. Leaf crate with no I/O."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
+chrono = { workspace = true }

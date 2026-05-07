@@ -1,0 +1,50 @@
+[package]
+name = "cognitive-memory-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The cognitive-memory daemon binary. Owns the SQLite store, embedding model, and IPC accept loop."
+
+[lints]
+workspace = true
+
+[lib]
+name = "cognitive_memory_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cm-daemon"
+path = "src/main.rs"
+
+[features]
+# Default: ship with the local embedding model (bge-small-en-v1.5).
+# Disable for tests/CI to skip the fastembed-rs build.
+default = ["local-model"]
+local-model = ["cognitive-memory-embeddings/local-model"]
+
+[dependencies]
+cognitive-memory-core = { workspace = true }
+cognitive-memory-protocol = { workspace = true }
+cognitive-memory-store = { workspace = true }
+cognitive-memory-search = { workspace = true }
+cognitive-memory-embeddings = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+ulid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+sqlx = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+cognitive-memory-client = { workspace = true }
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }

@@ -1,0 +1,72 @@
+# Release workflow for cognitive-memory-daemon.
+#
+# Two flows:
+# 1. release-please opens / merges release PRs based on conventional commits.
+# 2. On a tag push (vX.Y.Z), build pre-built binaries for macOS (arm64,
+#    x86_64) and Linux (x86_64), upload to the GitHub Release.
+#
+# This workflow does not interpolate untrusted github.event.* fields into
+# `run:` commands. The only github.* references are env vars (matrix.target,
+# github.ref_name) consumed via shell variable expansion.
+
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build-binaries:
+    name: build ${{ matrix.target }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --release --workspace --target "$TARGET"
+      - name: package
+        env:
+          TARGET: ${{ matrix.target }}
+          REF: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          cd "target/$TARGET/release"
+          tar czf "../../../dist/cognitive-memory-${REF}-${TARGET}.tar.gz" \
+            cm cm-daemon cm-http
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz

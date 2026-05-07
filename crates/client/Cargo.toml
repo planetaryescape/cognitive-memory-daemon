@@ -1,0 +1,21 @@
+[package]
+name = "cognitive-memory-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust client library for cognitive-memory-daemon. Used by tests and any Rust-native consumer."
+
+[lints]
+workspace = true
+
+[dependencies]
+cognitive-memory-core = { workspace = true }
+cognitive-memory-protocol = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

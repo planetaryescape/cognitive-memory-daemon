@@ -1,0 +1,12 @@
+{
+  "id": 0,
+  "payload": {
+    "kind": "Event",
+    "body": {
+      "kind": "TickCompleted",
+      "memories_decayed": 17,
+      "consolidations_attempted": 2,
+      "occurred_at": "2026-05-07T12:34:56Z"
+    }
+  }
+}

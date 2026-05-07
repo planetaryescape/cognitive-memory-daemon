@@ -1,0 +1,33 @@
+[package]
+name = "cognitive-memory-embeddings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Embedding providers for cognitive-memory-daemon. Local default (bge-small-en-v1.5 via fastembed-rs) plus hosted overrides."
+
+[lints]
+workspace = true
+
+[dependencies]
+cognitive-memory-core = { workspace = true }
+cognitive-memory-store = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+fastembed = { workspace = true, optional = true }
+tokio = { workspace = true }
+
+[features]
+# `local-model` toggles the actual fastembed-rs runtime. Off by default in
+# unit-test runs so model download isn't a CI dependency. Daemon binary
+# enables it via its own Cargo features.
+default = []
+local-model = ["fastembed"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }

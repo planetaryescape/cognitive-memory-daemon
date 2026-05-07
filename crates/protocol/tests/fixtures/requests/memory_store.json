@@ -1,0 +1,15 @@
+{
+  "id": 1,
+  "payload": {
+    "kind": "Request",
+    "body": {
+      "bucket": "Memory",
+      "op": "Store",
+      "user_id": "default",
+      "content": "User dislikes mocked database tests.",
+      "category": "semantic",
+      "memory_type": "preference",
+      "metadata": "{\"project\":\"cognitive-memory\"}"
+    }
+  }
+}

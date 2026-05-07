@@ -1,0 +1,13 @@
+{
+  "id": 1,
+  "payload": {
+    "kind": "Response",
+    "body": {
+      "ok": true,
+      "data": {
+        "kind": "MemoryStored",
+        "id": "mem_01HZABCDEFGHJKMNPQRSTVWXYZ"
+      }
+    }
+  }
+}

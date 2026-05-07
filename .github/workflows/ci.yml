@@ -1,0 +1,80 @@
+# CI for cognitive-memory-daemon.
+#
+# Adapted from mxr/.github/workflows/ci.yml. We ship the essential jobs at v0;
+# expensive jobs (coverage, MSRV, multi-OS, mutation testing) get added per
+# ROADMAP phase.
+#
+# This workflow does not interpolate any untrusted github.event.* fields into
+# `run:` commands. The only github.* references are in `concurrency.group`
+# (safe YAML string) and standard checkout actions.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # TODO (Phase 4+): add architecture-boundaries job that greps the dep graph.
+  # TODO (Phase 0 onward, per docs/developer/test-discipline.md): add cargo-mutants
+  #   job, scoped per-crate per-PR. Skip on push-to-main (slow).
+  # TODO (Phase 13): coverage, MSRV, multi-OS build matrix, install smoke test.

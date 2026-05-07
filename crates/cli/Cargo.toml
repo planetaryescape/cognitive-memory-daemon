@@ -1,0 +1,32 @@
+[package]
+name = "cognitive-memory-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The cm CLI: client of cognitive-memory-daemon over Unix socket."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "cm"
+path = "src/main.rs"
+
+[dependencies]
+cognitive-memory-core = { workspace = true }
+cognitive-memory-protocol = { workspace = true }
+cognitive-memory-client = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+cognitive-memory-daemon = { workspace = true }
+cognitive-memory-store = { workspace = true }
+cognitive-memory-embeddings = { workspace = true }
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }

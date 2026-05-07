@@ -1,0 +1,14 @@
+{
+  "id": 1,
+  "payload": {
+    "kind": "Response",
+    "body": {
+      "ok": false,
+      "error": {
+        "kind": "ProtocolMismatch",
+        "message": "client sent 0, daemon supports 1",
+        "retriable": false
+      }
+    }
+  }
+}

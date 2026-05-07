@@ -1,0 +1,10 @@
+{
+  "id": 42,
+  "payload": {
+    "kind": "Request",
+    "body": {
+      "bucket": "Diagnostics",
+      "op": "Status"
+    }
+  }
+}

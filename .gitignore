@@ -1,0 +1,28 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.*
+
+# fastembed-rs / Hugging Face model caches (regenerated on first run; ~130MB)
+.fastembed_cache/
+**/.fastembed_cache/
+hf-hub-cache/
+
+# cargo-mutants output (regenerated; not source)
+mutants.out/
+
+# macOS
+.DS_Store
+
+# Editor scratch
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local cm-daemon runtime artefacts (in case anyone runs it from the repo)
+*.sock
+*.pid
+*.db
+*.db-shm
+*.db-wal

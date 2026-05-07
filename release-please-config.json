@@ -1,0 +1,30 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "rust",
+  "include-component-in-tag": false,
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": true,
+  "draft": false,
+  "prerelease": false,
+  "packages": {
+    ".": {
+      "release-type": "rust",
+      "package-name": "cognitive-memory-daemon",
+      "extra-files": [
+        "crates/core/Cargo.toml",
+        "crates/protocol/Cargo.toml",
+        "crates/store/Cargo.toml",
+        "crates/search/Cargo.toml",
+        "crates/embeddings/Cargo.toml",
+        "crates/llm/Cargo.toml",
+        "crates/lifecycle/Cargo.toml",
+        "crates/graph/Cargo.toml",
+        "crates/client/Cargo.toml",
+        "crates/daemon/Cargo.toml",
+        "crates/cli/Cargo.toml",
+        "crates/http-bridge/Cargo.toml"
+      ]
+    }
+  },
+  "plugins": ["sentence-case"]
+}

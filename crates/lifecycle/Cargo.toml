@@ -1,0 +1,23 @@
+[package]
+name = "cognitive-memory-lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Decay, consolidation, expiry, promotion. Memory as lifecycle, not database."
+
+[lints]
+workspace = true
+
+[dependencies]
+cognitive-memory-core = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "parity_bench"
+harness = false

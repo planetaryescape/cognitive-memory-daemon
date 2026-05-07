@@ -1,0 +1,13 @@
+{
+  "id": 7,
+  "payload": {
+    "kind": "Request",
+    "body": {
+      "bucket": "Diagnostics",
+      "op": "MintBridgeToken",
+      "user_id": "default",
+      "scope": "write",
+      "ttl_seconds": 2592000
+    }
+  }
+}

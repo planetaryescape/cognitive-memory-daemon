@@ -1,0 +1,23 @@
+[package]
+name = "cognitive-memory-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vector and hybrid retrieval for cognitive-memory-daemon."
+
+[lints]
+workspace = true
+
+[dependencies]
+cognitive-memory-core = { workspace = true }
+cognitive-memory-store = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+cognitive-memory-embeddings = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+pretty_assertions = { workspace = true }

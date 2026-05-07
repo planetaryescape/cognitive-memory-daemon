@@ -1,0 +1,26 @@
+[package]
+name = "cognitive-memory-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LLM providers and extractor for cognitive-memory-daemon."
+
+[lints]
+workspace = true
+
+[dependencies]
+cognitive-memory-core = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+wiremock = "0.6"
+tokio = { workspace = true, features = ["macros", "rt"] }

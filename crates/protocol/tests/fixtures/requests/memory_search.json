@@ -1,0 +1,15 @@
+{
+  "id": 2,
+  "payload": {
+    "kind": "Request",
+    "body": {
+      "bucket": "Memory",
+      "op": "Search",
+      "user_id": "default",
+      "query": "How does the user feel about mocks?",
+      "limit": 5,
+      "deep_recall": false,
+      "hybrid": false
+    }
+  }
+}

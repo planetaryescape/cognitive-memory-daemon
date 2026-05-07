@@ -1,0 +1,15 @@
+{
+  "id": 42,
+  "payload": {
+    "kind": "Response",
+    "body": {
+      "ok": true,
+      "data": {
+        "kind": "Status",
+        "daemon_version": "0.0.1",
+        "uptime_seconds": 12345,
+        "memory_count": 4321
+      }
+    }
+  }
+}

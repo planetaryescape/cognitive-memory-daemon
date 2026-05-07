@@ -1,0 +1,14 @@
+{
+  "id": 7,
+  "payload": {
+    "kind": "Response",
+    "body": {
+      "ok": true,
+      "data": {
+        "kind": "BridgeToken",
+        "token": "cmb_01HZABCDEFGHJKMNPQRSTVWXYZ01HZABCDEFGHJKMNPQRSTVWXYZ",
+        "expires_at_unix": 1736208000
+      }
+    }
+  }
+}

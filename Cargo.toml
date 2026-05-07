@@ -1,0 +1,127 @@
+# Workspace root for cognitive-memory-daemon.
+# Virtual workspace: there is no root package. The three binaries (`cm-daemon`,
+# `cm`, `cm-http`) live in their own crates under `crates/`.
+#
+# Pattern adapted from mxr (/Users/bhekanik/code/planetaryescape/mxr/Cargo.toml).
+# See docs/developer/code-reuse.md for the vendoring map.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/protocol",
+    "crates/store",
+    "crates/search",
+    "crates/embeddings",
+    "crates/llm",
+    "crates/lifecycle",
+    "crates/graph",
+    "crates/client",
+    "crates/daemon",
+    "crates/cli",
+    "crates/http-bridge",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.88"
+repository = "https://github.com/bhekanik/cognitive-memory"
+homepage = "https://github.com/bhekanik/cognitive-memory"
+keywords = ["memory", "ai", "agent", "daemon", "local-first"]
+categories = ["database", "command-line-utilities"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+panic = "warn"
+todo = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+[workspace.dependencies]
+# Internal crates.
+cognitive-memory-core = { path = "crates/core", version = "0.0.1" }
+cognitive-memory-protocol = { path = "crates/protocol", version = "0.0.1" }
+cognitive-memory-store = { path = "crates/store", version = "0.0.1" }
+cognitive-memory-search = { path = "crates/search", version = "0.0.1" }
+cognitive-memory-embeddings = { path = "crates/embeddings", version = "0.0.1" }
+cognitive-memory-llm = { path = "crates/llm", version = "0.0.1" }
+cognitive-memory-lifecycle = { path = "crates/lifecycle", version = "0.0.1" }
+cognitive-memory-graph = { path = "crates/graph", version = "0.0.1" }
+cognitive-memory-client = { path = "crates/client", version = "0.0.1" }
+cognitive-memory-daemon = { path = "crates/daemon", version = "0.0.1" }
+
+# Async runtime.
+tokio = { version = "1", features = ["full"] }
+
+# Futures combinators (used in client / daemon for sink+stream framed I/O).
+futures = "0.3"
+
+# Serialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bytes = "0.11"
+
+# Database.
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "migrate"] }
+
+# IPC framing.
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+
+# Error handling.
+thiserror = "2"
+anyhow = "1"
+
+# Logging.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Async traits.
+async-trait = "0.1"
+
+# Types.
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+ulid = { version = "1", features = ["serde"] }
+
+# CLI.
+clap = { version = "4", features = ["derive", "env"] }
+
+# Directories and config.
+dirs = "6"
+toml = "0.8"
+
+# Process control (signal-probe single-instance).
+nix = { version = "0.30", features = ["signal", "process"] }
+
+# Hashing (cache keys, token hashes).
+sha2 = "0.10"
+
+# Constant-time comparisons (token validation).
+subtle = "2"
+
+# Embeddings (Phase 2+).
+fastembed = "4"
+
+# HTTP bridge (Phase 12+).
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# LLM providers (Phase 10+).
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Testing.
+tempfile = "3"
+pretty_assertions = "1"
+proptest = "1"
+insta = { version = "1", features = ["json"] }
+assert_cmd = "2"
+predicates = "3"
