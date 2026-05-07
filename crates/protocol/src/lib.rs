@@ -448,7 +448,7 @@ pub struct RetentionUpdate {
 /// Inputs for `Memory::Store`. v1 stores one memory per call. Embedding
 /// is computed daemon-side using the configured provider; clients do not
 /// supply vectors.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoreMemoryArgs {
     pub user_id: String,
     pub content: String,
@@ -456,6 +456,11 @@ pub struct StoreMemoryArgs {
     pub memory_type: String,
     #[serde(default = "default_metadata")]
     pub metadata: String,
+    /// Optional explicit importance in [0.0, 1.0]. When omitted, the
+    /// daemon uses its default (currently 0.0). Additive on the wire —
+    /// older clients omit the field; older daemons ignore it.
+    #[serde(default)]
+    pub importance: Option<f64>,
 }
 
 fn default_metadata() -> String {

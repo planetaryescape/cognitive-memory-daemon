@@ -159,6 +159,8 @@ struct StoreBody {
     memory_type: String,
     #[serde(default = "default_metadata")]
     metadata: String,
+    #[serde(default)]
+    importance: Option<f64>,
 }
 fn default_category() -> String {
     "semantic".to_string()
@@ -210,6 +212,7 @@ async fn memory_store(
         category: body.category,
         memory_type: body.memory_type,
         metadata: body.metadata,
+        importance: body.importance,
     }));
     daemon_call(&mut client, req).await
 }

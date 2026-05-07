@@ -21,7 +21,7 @@ use cognitive_memory_store::{
     AssociationRepo, MemoryFilters, MemoryRepo, MemoryRow, MemoryUpdate, Store,
 };
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use tokio::sync::Semaphore;
 use tracing::{debug, instrument};
 
@@ -49,6 +49,11 @@ pub struct AppState {
     pub store: Store,
     pub embeddings: Arc<dyn EmbeddingProvider>,
     pub request_semaphore: Arc<Semaphore>,
+    /// Monotonic clock anchor set when `AppState` is constructed. Used
+    /// to compute `StatusData::uptime_seconds`. Monotonic (not wall
+    /// clock) so suspend/clock-skew don't produce negative or
+    /// nonsensical uptimes.
+    pub started_at: Instant,
 }
 
 #[instrument(skip(req, state), fields(user_id = %user_id))]
@@ -81,7 +86,7 @@ async fn handle_status(state: &Arc<AppState>) -> Result<Response, HandlerError> 
         .await?;
     Ok(Response::ok(ResponseData::Status(StatusData {
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-        uptime_seconds: 0,
+        uptime_seconds: state.started_at.elapsed().as_secs(),
         memory_count: count.0 as u64,
     })))
 }
@@ -211,6 +216,9 @@ async fn handle_memory_store(
     row.embedding_provider = Some(state.embeddings.name().to_string());
     row.embedding_model = Some(state.embeddings.model().to_string());
     row.metadata = args.metadata;
+    if let Some(imp) = args.importance {
+        row.importance = imp.clamp(0.0, 1.0);
+    }
     // Synaptic tagging (paper §3.4): category=core triggers protected
     // retention floor at encoding time.
     if args.category == "core" {

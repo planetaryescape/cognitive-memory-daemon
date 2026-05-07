@@ -64,6 +64,10 @@ enum Command {
         /// (paper §3.4). Sets retention floor to 0.6 daemon-side.
         #[arg(long)]
         core: bool,
+        /// Initial importance in [0.0, 1.0]. Daemon clamps to that range.
+        /// Omit to use the daemon's default.
+        #[arg(long)]
+        importance: Option<f64>,
     },
 
     /// Store many memories in one call. Co-creation associations link
@@ -279,6 +283,7 @@ async fn run_command(client: &mut Client, cli: &Cli) -> Result<Response> {
             memory_type,
             metadata,
             core,
+            importance,
         } => {
             let cat = if *core {
                 "core".to_string()
@@ -291,6 +296,7 @@ async fn run_command(client: &mut Client, cli: &Cli) -> Result<Response> {
                 category: cat,
                 memory_type: memory_type.clone(),
                 metadata: metadata.clone(),
+                importance: *importance,
             }))
         }
 
@@ -599,8 +605,10 @@ fn print_human(resp: &Response) {
         Some(ResponseData::Status(s)) => {
             let _ = writeln!(
                 out,
-                "daemon: {} (memories: {}, uptime: {}s)",
-                s.daemon_version, s.memory_count, s.uptime_seconds
+                "daemon: {} (memories: {}, uptime: {})",
+                s.daemon_version,
+                s.memory_count,
+                format_uptime(s.uptime_seconds)
             );
         }
         Some(ResponseData::Counts(c)) => {
@@ -700,6 +708,27 @@ fn default_socket_path() -> PathBuf {
         .expect("data dir resolvable")
         .join("cognitive-memory")
         .join("cm.sock")
+}
+
+/// Render a duration in seconds as `1d 2h 3m 4s`, dropping leading zero
+/// units. `< 1s` becomes `0s`.
+fn format_uptime(secs: u64) -> String {
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    let seconds = secs % 60;
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 || !parts.is_empty() {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 || !parts.is_empty() {
+        parts.push(format!("{minutes}m"));
+    }
+    parts.push(format!("{seconds}s"));
+    parts.join(" ")
 }
 
 async fn connect_or_spawn(socket: &Path, user_id: &str, auto_spawn: bool) -> Result<Client> {

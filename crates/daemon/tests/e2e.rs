@@ -97,6 +97,7 @@ async fn store_then_search_returns_the_stored_memory() {
             category: "semantic".to_string(),
             memory_type: "preference".to_string(),
             metadata: "{}".to_string(),
+            importance: None,
         })))
         .await
         .unwrap();
@@ -299,6 +300,7 @@ async fn list_filter_link_update_delete_full_crud_loop() {
             category: "semantic".to_string(),
             memory_type: "fact".to_string(),
             metadata: "{}".to_string(),
+            importance: None,
         })))
         .await
         .unwrap();
@@ -314,6 +316,7 @@ async fn list_filter_link_update_delete_full_crud_loop() {
             category: "semantic".to_string(),
             memory_type: "preference".to_string(),
             metadata: "{}".to_string(),
+            importance: None,
         })))
         .await
         .unwrap();
@@ -470,6 +473,7 @@ async fn lifecycle_clear_requires_confirmation() {
             category: "semantic".to_string(),
             memory_type: "fact".to_string(),
             metadata: "{}".to_string(),
+            importance: None,
         })))
         .await
         .unwrap();
@@ -507,6 +511,7 @@ async fn search_isolates_results_by_user_id_at_the_daemon_layer() {
             category: "semantic".to_string(),
             memory_type: "fact".to_string(),
             metadata: "{}".to_string(),
+            importance: None,
         })))
         .await
         .unwrap();
@@ -533,6 +538,110 @@ async fn search_isolates_results_by_user_id_at_the_daemon_layer() {
         }
         other => panic!("expected MemorySearchResults, got {other:?}"),
     }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Behavioural test for the `--importance` flag: when a client supplies
+/// importance, the daemon writes it onto the row (clamped to [0, 1]) and
+/// it round-trips through Get. With no importance, the daemon's default
+/// (0.0) stands.
+#[tokio::test]
+async fn store_writes_importance_when_supplied_and_clamps_out_of_range() {
+    let (handle, socket, shutdown, _tmp) = boot_daemon().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    async fn store(client: &mut Client, content: &str, importance: Option<f64>) -> String {
+        let resp = client
+            .request(Request::Memory(MemoryRequest::Store(StoreMemoryArgs {
+                user_id: "alice".to_string(),
+                content: content.to_string(),
+                category: "semantic".to_string(),
+                memory_type: "fact".to_string(),
+                metadata: "{}".to_string(),
+                importance,
+            })))
+            .await
+            .unwrap();
+        match resp.data.unwrap() {
+            ResponseData::MemoryStored(s) => s.id,
+            other => panic!("expected MemoryStored, got {other:?}"),
+        }
+    }
+
+    async fn fetch_importance(client: &mut Client, id: &str) -> f64 {
+        let resp = client
+            .request(Request::Memory(MemoryRequest::Get(GetMemoryArgs {
+                user_id: "alice".to_string(),
+                id: id.to_string(),
+            })))
+            .await
+            .unwrap();
+        match resp.data.unwrap() {
+            ResponseData::Memory(m) => m.importance,
+            other => panic!("expected Memory, got {other:?}"),
+        }
+    }
+
+    let with_imp_id = store(&mut client, "with importance", Some(0.9)).await;
+    let no_imp_id = store(&mut client, "no importance", None).await;
+    let over_id = store(&mut client, "out of range", Some(2.5)).await;
+
+    let m1 = fetch_importance(&mut client, &with_imp_id).await;
+    assert!(
+        (m1 - 0.9).abs() < f64::EPSILON,
+        "explicit importance should round-trip; got {m1}"
+    );
+
+    let m2 = fetch_importance(&mut client, &no_imp_id).await;
+    assert_eq!(m2, 0.0, "absent importance should fall through to default");
+
+    let m3 = fetch_importance(&mut client, &over_id).await;
+    assert!(
+        (m3 - 1.0).abs() < f64::EPSILON,
+        "out-of-range importance should clamp to 1.0; got {m3}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Status uptime must reflect actual elapsed time, not the bug at
+/// 0.0.1 release where the field was hardcoded to 0.
+#[tokio::test]
+async fn status_uptime_advances_with_wall_clock() {
+    let (handle, socket, shutdown, _tmp) = boot_daemon().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let first = client
+        .request(Request::Diagnostics(DiagnosticsRequest::Status))
+        .await
+        .unwrap();
+    let first_uptime = match first.data.unwrap() {
+        ResponseData::Status(s) => s.uptime_seconds,
+        other => panic!("expected Status, got {other:?}"),
+    };
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    let second = client
+        .request(Request::Diagnostics(DiagnosticsRequest::Status))
+        .await
+        .unwrap();
+    let second_uptime = match second.data.unwrap() {
+        ResponseData::Status(s) => s.uptime_seconds,
+        other => panic!("expected Status, got {other:?}"),
+    };
+
+    assert!(
+        second_uptime > first_uptime,
+        "uptime must advance: first={first_uptime}s second={second_uptime}s"
+    );
 
     let _ = shutdown.send(());
     let _ = handle.await;

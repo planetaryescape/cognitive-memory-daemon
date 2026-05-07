@@ -11,6 +11,7 @@ use cognitive_memory_store::Store;
 use futures::{SinkExt, StreamExt};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Semaphore};
@@ -49,6 +50,7 @@ impl Daemon {
             store,
             embeddings,
             request_semaphore: Arc::new(Semaphore::new(REQUEST_CONCURRENCY_LIMIT)),
+            started_at: Instant::now(),
         });
         Self {
             state,

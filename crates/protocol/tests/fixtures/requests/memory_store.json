@@ -9,7 +9,8 @@
       "content": "User dislikes mocked database tests.",
       "category": "semantic",
       "memory_type": "preference",
-      "metadata": "{\"project\":\"cognitive-memory\"}"
+      "metadata": "{\"project\":\"cognitive-memory\"}",
+      "importance": null
     }
   }
 }
