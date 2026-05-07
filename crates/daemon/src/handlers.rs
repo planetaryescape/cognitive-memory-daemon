@@ -20,7 +20,7 @@ use cognitive_memory_protocol::{
     SearchLexicalArgs, SearchMemoryArgs, StatusData, StoreBatchArgs, StoreMemoryArgs, TickArgs,
     TickResultData, UnlinkMemoryArgs, UpdateMemoryArgs, UpdateRetentionArgs, VectorSearchArgs,
 };
-use cognitive_memory_search::{SearchError, SearchOptions, Searcher};
+use cognitive_memory_search::{ResultSource, SearchError, SearchOptions, Searcher};
 use cognitive_memory_store::{
     AssociationRepo, MemoryFilters, MemoryRepo, MemoryRow, MemoryUpdate, Store,
 };
@@ -260,6 +260,10 @@ const STABILITY_REINFORCEMENT_THRESHOLD: f64 = 0.75;
 /// SDK core.py:223 — `stability + 0.05`.
 const STABILITY_REINFORCEMENT_AMOUNT: f64 = 0.05;
 
+/// Bump applied to every association edge between co-retrieved
+/// memories (paper Eq 9). SDK default `association_strengthen_amount = 0.1`.
+const ASSOCIATION_STRENGTHEN_AMOUNT: f64 = 0.1;
+
 /// Cosine threshold above which a co-ingested memory is auto-linked
 /// to existing memories. Mirrors INGESTION_ASSOCIATION_THRESHOLD
 /// in cognitive_memory/core.py:40 (= 0.4).
@@ -483,12 +487,35 @@ async fn handle_memory_search(
     let anchor_ids: Vec<String> = results.iter().map(|r| r.memory_id.clone()).collect();
     let bridge_paths = searcher.find_bridges(&anchor_ids, &opts).await?;
 
-    // Read-side strengthening: apply spaced-repetition direct boost,
-    // record the session, and check core-promotion eligibility.
-    // Mirrors `_apply_direct_boost` (engine.py:148-160) and the
-    // post-retrieval core check (engine.py:615).
+    // Read-side strengthening: apply spaced-repetition direct boost
+    // (Eq 6) for direct hits or associative boost (Eq 8) for graph-
+    // expanded hits, refresh last_accessed_at, record the session,
+    // and check core-promotion eligibility. Mirrors
+    // `_apply_direct_boost` (engine.py:148-160) +
+    // `_apply_associative_boost` (engine.py:162-174).
     if !anchor_ids.is_empty() {
-        apply_post_retrieval_strengthening(state, &args.user_id, &anchor_ids, now).await?;
+        let tagged: Vec<(String, ResultSource)> = results
+            .iter()
+            .map(|r| (r.memory_id.clone(), r.source))
+            .collect();
+        apply_post_retrieval_strengthening(state, &args.user_id, &tagged, now).await?;
+        // Co-retrieval strengthening (engine.py:621-625): every
+        // unordered pair in the result set gets a `+0.1` bump
+        // (capped at 1.0) on both directions, with refreshed
+        // last_co_retrieval. Cap pairs at the top-K = limit (we use
+        // up to 10) to avoid quadratic growth on large result sets.
+        let top_k: Vec<&String> = anchor_ids.iter().take(10).collect();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for i in 0..top_k.len() {
+            for j in (i + 1)..top_k.len() {
+                pairs.push((top_k[i].clone(), top_k[j].clone()));
+            }
+        }
+        if !pairs.is_empty() {
+            AssociationRepo::new(&state.store)
+                .strengthen_pairs(&pairs, ASSOCIATION_STRENGTHEN_AMOUNT, now, "co-retrieval")
+                .await?;
+        }
     }
 
     let hits: Vec<SearchHit> = results
@@ -520,11 +547,17 @@ async fn handle_memory_search(
 async fn apply_post_retrieval_strengthening(
     state: &Arc<AppState>,
     user_id: &str,
-    retrieved_ids: &[String],
+    retrieved: &[(String, ResultSource)],
     now: i64,
 ) -> Result<(), HandlerError> {
     let mem_repo = MemoryRepo::new(&state.store);
-    let rows = mem_repo.get_many_for_user(user_id, retrieved_ids).await?;
+    let ids: Vec<String> = retrieved.iter().map(|(id, _)| id.clone()).collect();
+    let rows = mem_repo.get_many_for_user(user_id, &ids).await?;
+    // Map id → source for per-row dispatch.
+    let source_by_id: std::collections::HashMap<&str, ResultSource> = retrieved
+        .iter()
+        .map(|(id, src)| (id.as_str(), *src))
+        .collect();
 
     let cfg = lifecycle_config();
     let mut boosts: Vec<(String, f64)> = Vec::with_capacity(rows.len());
@@ -536,7 +569,15 @@ async fn apply_post_retrieval_strengthening(
         }
         let dt_days = ((now - row.last_accessed_at).max(0) as f64) / 86_400.0;
         let factor = (dt_days / cfg.spaced_rep_interval_days).min(cfg.max_spaced_rep_multiplier);
-        let new_stability = (row.stability + cfg.direct_boost * factor).min(1.0);
+        // Direct hits get +0.1 stability bump (Eq 6); graph-expanded
+        // hits get the smaller +0.03 (Eq 8). Source defaults to
+        // Direct if missing — backward-compat for callers that don't
+        // tag (none today).
+        let bump_amount = match source_by_id.get(row.id.as_str()) {
+            Some(ResultSource::GraphExpanded) => cfg.associative_boost,
+            _ => cfg.direct_boost,
+        };
+        let new_stability = (row.stability + bump_amount * factor).min(1.0);
         boosts.push((row.id.clone(), new_stability));
 
         // Core-promotion gate uses post-boost stability, post-increment

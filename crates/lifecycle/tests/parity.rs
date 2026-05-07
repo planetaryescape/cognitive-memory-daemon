@@ -8,8 +8,9 @@
 #![allow(clippy::panic, clippy::unwrap_used)]
 
 use cognitive_memory_lifecycle::{
-    apply_direct_boost, check_core_promotion, compute_retention, score_memory, session_root,
-    stability_from_importance, Category, DecayModel, LifecycleConfig, MemoryState,
+    apply_direct_boost, check_core_promotion, compute_retention, decay_association_weight,
+    score_memory, session_root, stability_from_importance, Category, DecayModel, LifecycleConfig,
+    MemoryState,
 };
 use pretty_assertions::assert_eq;
 
@@ -257,4 +258,52 @@ fn stability_baseline_at_max_importance() {
     // SDK: core.py:126 — importance=1.0 → 0.1 + 1.0*0.3 = 0.4.
     // Boundary at importance ceiling.
     assert!(approx_eq(stability_from_importance(1.0), 0.4, TOL));
+}
+
+// ===========================================================================
+// decay_association_weight — paper Eq 10:
+//   w' = w * exp(-Δt_days / τ)   (default τ = 90 days)
+// Mirrors `decay_association` in engine.py:217-229. Operates on stored
+// edge weight + last_co_retrieval at read time; does not write back.
+// ===========================================================================
+
+const SECONDS_PER_DAY: i64 = 86_400;
+
+#[test]
+fn association_decay_at_thirty_days_with_tau_ninety() {
+    // SDK Eq 10: w' = 0.8 * exp(-30/90) = 0.8 * exp(-1/3).
+    // exp(-1/3) ≈ 0.71653. → expected ≈ 0.57322.
+    let now: i64 = 1_700_000_000;
+    let last = now - 30 * SECONDS_PER_DAY;
+    let decayed = decay_association_weight(0.8, last, now, 90.0);
+    let expected = 0.8 * (-1.0_f64 / 3.0).exp();
+    assert!(
+        approx_eq(decayed, expected, TOL),
+        "30d decay: expected {expected}, got {decayed}"
+    );
+}
+
+#[test]
+fn association_decay_at_zero_age_is_identity() {
+    // Δt=0 ⇒ exp(0) = 1.0 ⇒ no decay. The just-co-retrieved edge is
+    // returned at full weight.
+    let now: i64 = 1_700_000_000;
+    let decayed = decay_association_weight(0.8, now, now, 90.0);
+    assert!(
+        approx_eq(decayed, 0.8, TOL),
+        "0d decay must be identity, got {decayed}"
+    );
+}
+
+#[test]
+fn association_decay_at_long_horizon_approaches_zero() {
+    // 10 years (3650 days) at τ=90 ⇒ exp(-3650/90) = exp(-40.55…) ≈ 0.
+    // The stored weight effectively vanishes; threshold gates exclude it.
+    let now: i64 = 1_700_000_000;
+    let last = now - 3650 * SECONDS_PER_DAY;
+    let decayed = decay_association_weight(0.8, last, now, 90.0);
+    assert!(
+        decayed < 1e-15,
+        "10y decay should approach 0, got {decayed}"
+    );
 }

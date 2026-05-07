@@ -936,6 +936,391 @@ async fn ingest_at_conflict_threshold_only_queues() {
     let _ = handle.await;
 }
 
+/// Plant a memory directly via SQL with a *stale* embedding provider
+/// pair so it's invisible to `candidates_for_search` (which filters
+/// on the active provider/model) but still discoverable via the
+/// associations table by graph expansion.
+#[allow(clippy::too_many_arguments)]
+async fn plant_memory_with_stale_provider(
+    store: &Store,
+    id: &str,
+    user_id: &str,
+    content: &str,
+    embedding: Vec<f32>,
+    now: i64,
+) {
+    let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+    sqlx::query(
+        "INSERT INTO memories (
+            id, user_id, content, category, memory_type, embedding,
+            embedding_provider, embedding_model, created_at, last_accessed_at,
+            valid_from, valid_until, ttl_seconds, retention_floor,
+            retrieval_count, metadata, importance, stability, is_cold,
+            cold_since, days_at_floor, is_superseded, superseded_by, is_stub,
+            stub_content, contradicted_by, session_ids
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id).bind(user_id).bind(content)
+    .bind("semantic").bind("fact").bind(bytes)
+    .bind("stale-provider").bind("stale-model")
+    .bind(now).bind(now).bind::<Option<i64>>(None).bind::<Option<i64>>(None)
+    .bind::<Option<i64>>(None).bind(0.0_f64).bind(0_i64).bind("{}".to_string())
+    .bind(0.0_f64).bind(0.5_f64).bind(0_i64).bind::<Option<i64>>(None)
+    .bind(0_i64).bind(0_i64).bind::<Option<String>>(None)
+    .bind(0_i64).bind::<Option<String>>(None).bind::<Option<String>>(None)
+    .bind("[]".to_string())
+    .execute(store.writer()).await.unwrap();
+}
+
+/// Association decay on read (paper Eq 10): when graph expansion
+/// surfaces a linked memory, its composite score uses
+/// `stored_weight * exp(-Δt_days/90)`, not the stored weight.
+///
+/// Setup avoids the dense-search confounder by planting target under
+/// a stale (provider, model) so dense excludes it; only graph
+/// expansion can surface it.
+#[tokio::test]
+async fn graph_expansion_uses_decayed_edge_weight() {
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_embeddings().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let mut v_anchor = vec![0.0f32; 16];
+    v_anchor[0] = 1.0;
+    embeddings.set_override("anchor decay test", v_anchor.clone());
+    embeddings.set_override("decay query identical", v_anchor);
+
+    let anchor_id = store_helper(&mut client, "anchor decay test", "semantic").await;
+
+    let target_id = format!("mem_{}", ulid::Ulid::new());
+    let mut v_target = vec![0.0f32; 16];
+    v_target[0] = 0.5;
+    v_target[1] = (0.75f32).sqrt(); // cos(target, query) = 0.5
+
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Δt=30d so decayed weight (0.8*exp(-1/3) ≈ 0.573) stays above
+    // the 0.3 graph-expansion threshold. The threshold-drop case is
+    // tested separately by graph_expansion_drops_edges_below_decayed_threshold.
+    let last_co = now - 30 * 86_400;
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    plant_memory_with_stale_provider(&store, &target_id, "alice", "planted target", v_target, now)
+        .await;
+    sqlx::query(
+        "INSERT INTO associations
+            (source_memory_id, target_memory_id, weight, kind,
+             updated_at, last_co_retrieval)
+         VALUES (?, ?, ?, 'thematic', ?, ?)",
+    )
+    .bind(&anchor_id)
+    .bind(&target_id)
+    .bind(0.8_f64)
+    .bind(now)
+    .bind(last_co)
+    .execute(store.writer())
+    .await
+    .unwrap();
+    drop(store);
+
+    let resp = client
+        .request(Request::Memory(MemoryRequest::Search(SearchMemoryArgs {
+            user_id: "alice".to_string(),
+            query: "decay query identical".to_string(),
+            limit: 5,
+            deep_recall: false,
+            hybrid: false,
+            graph_expansion_hops: 1,
+            bridge_discovery: false,
+        })))
+        .await
+        .unwrap();
+    let results = match resp.data.unwrap() {
+        ResponseData::MemorySearchResults(r) => r.results,
+        _ => panic!("expected MemorySearchResults"),
+    };
+    let target_score = results
+        .iter()
+        .find(|r| r.memory_id == target_id)
+        .expect("target should surface via graph expansion only")
+        .score as f64;
+
+    // SDK Eq 10: live_weight = 0.8 * exp(-30/90) = 0.8 * exp(-1/3) ≈ 0.5731.
+    // Composite = cos(query, target=0.5) * R(target)^α * live_weight.
+    // Target's last_accessed_at = now, so R=1.0, R^α=1.0.
+    // Composite = 0.5 * 0.5731 ≈ 0.2865.
+    let expected = 0.5 * 0.8 * (-1.0_f64 / 3.0).exp();
+    assert!(
+        (target_score - expected).abs() < 0.01,
+        "decayed composite expected ≈ {expected}, got {target_score}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// When the decayed edge weight drops below `min_bridge_edge_weight`
+/// (default 0.3), the linked memory must NOT appear in graph
+/// expansion. Stored 0.5 with τ=90 and Δt=90d → decayed ≈ 0.184.
+#[tokio::test]
+async fn graph_expansion_drops_edges_below_decayed_threshold() {
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_embeddings().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let mut v_anchor = vec![0.0f32; 16];
+    v_anchor[0] = 1.0;
+    embeddings.set_override("anchor below threshold", v_anchor.clone());
+    embeddings.set_override("threshold query", v_anchor);
+
+    let anchor_id = store_helper(&mut client, "anchor below threshold", "semantic").await;
+
+    let target_id = format!("mem_{}", ulid::Ulid::new());
+    let mut v_target = vec![0.0f32; 16];
+    v_target[0] = 0.5;
+    v_target[1] = (0.75f32).sqrt();
+
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let last_co = now - 90 * 86_400;
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    plant_memory_with_stale_provider(&store, &target_id, "alice", "hidden target", v_target, now)
+        .await;
+    sqlx::query(
+        "INSERT INTO associations
+            (source_memory_id, target_memory_id, weight, kind,
+             updated_at, last_co_retrieval)
+         VALUES (?, ?, ?, 'thematic', ?, ?)",
+    )
+    .bind(&anchor_id)
+    .bind(&target_id)
+    .bind(0.5_f64)
+    .bind(now)
+    .bind(last_co)
+    .execute(store.writer())
+    .await
+    .unwrap();
+    drop(store);
+
+    let resp = client
+        .request(Request::Memory(MemoryRequest::Search(SearchMemoryArgs {
+            user_id: "alice".to_string(),
+            query: "threshold query".to_string(),
+            limit: 5,
+            deep_recall: false,
+            hybrid: false,
+            graph_expansion_hops: 1,
+            bridge_discovery: false,
+        })))
+        .await
+        .unwrap();
+    let ids: Vec<String> = match resp.data.unwrap() {
+        ResponseData::MemorySearchResults(r) => {
+            r.results.into_iter().map(|h| h.memory_id).collect()
+        }
+        _ => panic!("expected MemorySearchResults"),
+    };
+    assert!(
+        !ids.contains(&target_id),
+        "target should be excluded when decayed weight < 0.3, got results {ids:?}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Co-retrieval strengthening (paper Eq 9, engine.py:621-625): when
+/// a search returns N memories, every unordered pair in the result
+/// set has its association weight bumped by 0.1 (capped at 1.0) on
+/// BOTH directions. Edges that didn't exist are created at weight
+/// 0.1.
+#[tokio::test]
+async fn search_strengthens_associations_between_top_results() {
+    let (handle, socket, shutdown, _tmp, embeddings) = boot_daemon_with_embeddings().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    // Three memories whose embeddings all match the query at cos > 0
+    // so all three appear in the dense result set.
+    let mut v_q = vec![0.0f32; 16];
+    v_q[0] = 1.0;
+    let mut v_a = vec![0.0f32; 16];
+    v_a[0] = 1.0;
+    let mut v_b = vec![0.0f32; 16];
+    v_b[0] = 0.9;
+    v_b[1] = (0.19f32).sqrt();
+    let mut v_c = vec![0.0f32; 16];
+    v_c[0] = 0.8;
+    v_c[1] = (0.36f32).sqrt();
+    embeddings.set_override("co-retrieve query", v_q);
+    embeddings.set_override("co-retrieve A", v_a);
+    embeddings.set_override("co-retrieve B", v_b);
+    embeddings.set_override("co-retrieve C", v_c);
+
+    let a = store_helper(&mut client, "co-retrieve A", "semantic").await;
+    let b = store_helper(&mut client, "co-retrieve B", "semantic").await;
+    let c = store_helper(&mut client, "co-retrieve C", "semantic").await;
+
+    // Search returns A, B, C. Triggers strengthen_pairs for the 3
+    // unordered pairs (A,B), (A,C), (B,C).
+    let _ = client
+        .request(Request::Memory(MemoryRequest::Search(SearchMemoryArgs {
+            user_id: "alice".to_string(),
+            query: "co-retrieve query".to_string(),
+            limit: 5,
+            deep_recall: false,
+            hybrid: false,
+            graph_expansion_hops: 0,
+            bridge_discovery: false,
+        })))
+        .await
+        .unwrap();
+
+    // For each pair, confirm both directional edges exist with weight ≥ 0.1.
+    async fn weight_between(client: &mut Client, src: &str, tgt: &str) -> f64 {
+        let resp = client
+            .request(Request::Memory(MemoryRequest::GetLinked(GetLinkedArgs {
+                user_id: "alice".to_string(),
+                source_id: src.to_string(),
+                min_strength: 0.0,
+            })))
+            .await
+            .unwrap();
+        let linked = match resp.data.unwrap() {
+            ResponseData::LinkedMemories(d) => d.memories,
+            _ => panic!("expected LinkedMemories"),
+        };
+        linked
+            .into_iter()
+            .find(|lm| lm.memory.id == tgt)
+            .map(|lm| lm.link_strength)
+            .unwrap_or(0.0)
+    }
+
+    let pairs = [
+        (a.as_str(), b.as_str()),
+        (a.as_str(), c.as_str()),
+        (b.as_str(), c.as_str()),
+    ];
+    for (src, tgt) in pairs {
+        let fwd = weight_between(&mut client, src, tgt).await;
+        let bwd = weight_between(&mut client, tgt, src).await;
+        assert!(
+            (fwd - 0.1).abs() < 1e-6,
+            "{src} → {tgt} should be 0.1 after co-retrieval, got {fwd}"
+        );
+        assert!(
+            (bwd - 0.1).abs() < 1e-6,
+            "{tgt} → {src} should be 0.1 (bidirectional), got {bwd}"
+        );
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Boost differential by source (paper Eq 6 vs Eq 8): direct hits
+/// get +0.10 * spaced_rep_factor stability boost; graph-expanded
+/// hits get +0.03 * spaced_rep_factor. Tested with a 14-day-old
+/// pair (factor capped at 2.0 → direct +0.20, expanded +0.06).
+#[tokio::test]
+async fn search_applies_smaller_boost_to_graph_expanded_results() {
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_embeddings().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    // Direct hit A: same vector as query → cosine 1.
+    let mut v_q = vec![0.0f32; 16];
+    v_q[0] = 1.0;
+    embeddings.set_override("differential query", v_q.clone());
+    embeddings.set_override("anchor direct A", v_q.clone());
+    let direct_id = store_helper(&mut client, "anchor direct A", "semantic").await;
+
+    // Graph-expanded target B: planted with stale-provider so dense
+    // can't see it; reachable only via association from A.
+    let target_id = format!("mem_{}", ulid::Ulid::new());
+    let mut v_b = vec![0.0f32; 16];
+    v_b[0] = 0.5;
+    v_b[1] = (0.75f32).sqrt();
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    plant_memory_with_stale_provider(&store, &target_id, "alice", "graph target B", v_b, now).await;
+    sqlx::query(
+        "INSERT INTO associations
+            (source_memory_id, target_memory_id, weight, kind,
+             updated_at, last_co_retrieval)
+         VALUES (?, ?, ?, 'thematic', ?, ?)",
+    )
+    .bind(&direct_id)
+    .bind(&target_id)
+    .bind(0.8_f64)
+    .bind(now)
+    .bind(now)
+    .execute(store.writer())
+    .await
+    .unwrap();
+
+    // Backdate both 14 days so the spaced-rep factor is exactly 2.0
+    // (= max). last_accessed_at = now - 14d.
+    let backdate = now - 14 * 86_400;
+    sqlx::query("UPDATE memories SET last_accessed_at = ? WHERE id IN (?, ?)")
+        .bind(backdate)
+        .bind(&direct_id)
+        .bind(&target_id)
+        .execute(store.writer())
+        .await
+        .unwrap();
+    drop(store);
+
+    // Pre-state. direct.stability defaulted to 0.1 (Stage 1 fix);
+    // target.stability planted at 0.5.
+    // Run the search. Direct hit's stability bumps by 0.1*2 = 0.2
+    // → 0.3. Graph-expanded target's stability bumps by 0.03*2 = 0.06
+    // → 0.56.
+    let _ = client
+        .request(Request::Memory(MemoryRequest::Search(SearchMemoryArgs {
+            user_id: "alice".to_string(),
+            query: "differential query".to_string(),
+            limit: 5,
+            deep_recall: false,
+            hybrid: false,
+            graph_expansion_hops: 1,
+            bridge_discovery: false,
+        })))
+        .await
+        .unwrap();
+
+    let direct_post = fetch(&mut client, &direct_id).await;
+    let target_post = fetch(&mut client, &target_id).await;
+
+    assert!(
+        (direct_post.stability - 0.3).abs() < 1e-6,
+        "direct stability should be 0.1 + 0.10*2 = 0.3, got {}",
+        direct_post.stability
+    );
+    assert!(
+        (target_post.stability - 0.56).abs() < 1e-6,
+        "graph-expanded stability should be 0.5 + 0.03*2 = 0.56, got {}",
+        target_post.stability
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// Status uptime must reflect actual elapsed time, not the bug at
 /// 0.0.1 release where the field was hardcoded to 0.
 #[tokio::test]

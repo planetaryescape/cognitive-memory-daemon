@@ -831,12 +831,28 @@ pub struct AssociationRow {
     pub updated_at: i64,
 }
 
+/// Lightweight outgoing edge — the data needed to apply read-time
+/// association decay (paper Eq 10). `last_co_retrieval` is `None`
+/// only for legacy rows that pre-date migration v5 and lacked an
+/// `updated_at` to backfill from (rare).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct NeighborEdge {
+    pub target_id: String,
+    pub weight: f64,
+    pub last_co_retrieval: Option<i64>,
+}
+
 /// A memory plus the strength of the link that surfaced it. Mirrors the
 /// SDK's `Memory & { linkStrength: number }` projection.
 #[derive(Debug, Clone)]
 pub struct LinkedMemory {
     pub memory: MemoryRow,
     pub link_strength: f64,
+    /// `associations.last_co_retrieval` — unix seconds of the most
+    /// recent co-retrieval that strengthened this edge. None for
+    /// legacy edges that pre-date migration v5. Callers apply
+    /// `decay_association_weight` (Eq 10) using this timestamp.
+    pub last_co_retrieval: Option<i64>,
 }
 
 /// Repository over the `associations` table.
@@ -878,14 +894,75 @@ impl<'a> AssociationRepo<'a> {
         };
 
         sqlx::query(
-            "INSERT INTO associations (source_memory_id, target_memory_id, weight, kind, updated_at)
-             VALUES (?, ?, ?, ?, ?)
+            "INSERT INTO associations
+                 (source_memory_id, target_memory_id, weight, kind,
+                  updated_at, last_co_retrieval)
+             VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(source_memory_id, target_memory_id) DO UPDATE
-             SET weight = excluded.weight, kind = excluded.kind, updated_at = excluded.updated_at"
+             SET weight = excluded.weight,
+                 kind = excluded.kind,
+                 updated_at = excluded.updated_at,
+                 last_co_retrieval = excluded.last_co_retrieval",
         )
-        .bind(source_id).bind(target_id).bind(new_weight).bind(kind).bind(now)
-        .execute(self.writer).await?;
+        .bind(source_id)
+        .bind(target_id)
+        .bind(new_weight)
+        .bind(kind)
+        .bind(now)
+        .bind(now)
+        .execute(self.writer)
+        .await?;
         Ok(new_weight)
+    }
+
+    /// Apply co-retrieval strengthening to a batch of unordered pairs
+    /// in a single transaction. For each `(a, b)`: bump weight by
+    /// `amount` (capped at 1.0) on both `(a→b)` and `(b→a)` and
+    /// refresh `last_co_retrieval = now`. Mirrors the behaviour of
+    /// engine.py:621-625 + core.py:258-262.
+    ///
+    /// Atomic: a partial failure rolls back the whole batch.
+    pub async fn strengthen_pairs(
+        &self,
+        pairs: &[(String, String)],
+        amount: f64,
+        now: i64,
+        kind: &str,
+    ) -> Result<u64, sqlx::Error> {
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.writer.begin().await?;
+        let mut total = 0_u64;
+        for (a, b) in pairs {
+            for (src, tgt) in [(a, b), (b, a)] {
+                // UPSERT: insert with `amount` if new; bump on conflict.
+                // Inline of create_or_strengthen so we run inside the tx
+                // (the standalone repo method opens its own writer).
+                let r = sqlx::query(
+                    "INSERT INTO associations
+                         (source_memory_id, target_memory_id, weight,
+                          kind, updated_at, last_co_retrieval)
+                     VALUES (?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(source_memory_id, target_memory_id) DO UPDATE
+                     SET weight = MIN(1.0, weight + ?),
+                         updated_at = excluded.updated_at,
+                         last_co_retrieval = excluded.last_co_retrieval",
+                )
+                .bind(src)
+                .bind(tgt)
+                .bind(amount.min(1.0).max(0.0))
+                .bind(kind)
+                .bind(now)
+                .bind(now)
+                .bind(amount)
+                .execute(&mut *tx)
+                .await?;
+                total += r.rows_affected();
+            }
+        }
+        tx.commit().await?;
+        Ok(total)
     }
 
     /// Bidirectional create-or-strengthen: applies to both (a→b) and (b→a).
@@ -917,8 +994,8 @@ impl<'a> AssociationRepo<'a> {
     ) -> Result<Vec<LinkedMemory>, sqlx::Error> {
         // Need a temporary borrow of the reader pool for the second hop;
         // we reach into MemoryRepo via ad-hoc construction.
-        let edges: Vec<(String, f64)> = sqlx::query_as(
-            "SELECT target_memory_id, weight FROM associations
+        let edges: Vec<(String, f64, Option<i64>)> = sqlx::query_as(
+            "SELECT target_memory_id, weight, last_co_retrieval FROM associations
              WHERE source_memory_id = ? AND weight >= ?
              ORDER BY weight DESC",
         )
@@ -931,8 +1008,11 @@ impl<'a> AssociationRepo<'a> {
             return Ok(Vec::new());
         }
 
-        let ids: Vec<String> = edges.iter().map(|(id, _)| id.clone()).collect();
-        let weights: std::collections::HashMap<String, f64> = edges.into_iter().collect();
+        let ids: Vec<String> = edges.iter().map(|(id, _, _)| id.clone()).collect();
+        let edge_meta: std::collections::HashMap<String, (f64, Option<i64>)> = edges
+            .into_iter()
+            .map(|(id, w, last)| (id, (w, last)))
+            .collect();
 
         let mem_repo = MemoryRepo {
             writer: self.writer,
@@ -942,10 +1022,11 @@ impl<'a> AssociationRepo<'a> {
         Ok(mems
             .into_iter()
             .filter_map(|m| {
-                let strength = *weights.get(&m.id)?;
+                let (strength, last_co) = *edge_meta.get(&m.id)?;
                 Some(LinkedMemory {
                     memory: m,
                     link_strength: strength,
+                    last_co_retrieval: last_co,
                 })
             })
             .collect())
@@ -965,24 +1046,30 @@ impl<'a> AssociationRepo<'a> {
             .take(source_ids.len())
             .collect::<Vec<_>>()
             .join(",");
+        // MAX(weight) collapses parallel edges from multiple sources;
+        // MAX(last_co_retrieval) keeps the most recent co-retrieval
+        // timestamp among them — strongest, freshest interpretation.
         let sql = format!(
-            "SELECT target_memory_id, MAX(weight) AS w
+            "SELECT target_memory_id, MAX(weight) AS w, MAX(last_co_retrieval) AS last
              FROM associations
              WHERE source_memory_id IN ({ph}) AND weight >= ?
              GROUP BY target_memory_id ORDER BY w DESC"
         );
-        let mut q = sqlx::query_as::<_, (String, f64)>(&sql);
+        let mut q = sqlx::query_as::<_, (String, f64, Option<i64>)>(&sql);
         for id in source_ids {
             q = q.bind(id);
         }
         q = q.bind(min_weight);
-        let edges: Vec<(String, f64)> = q.fetch_all(self.reader).await?;
+        let edges: Vec<(String, f64, Option<i64>)> = q.fetch_all(self.reader).await?;
 
         if edges.is_empty() {
             return Ok(Vec::new());
         }
-        let ids: Vec<String> = edges.iter().map(|(id, _)| id.clone()).collect();
-        let weights: std::collections::HashMap<String, f64> = edges.into_iter().collect();
+        let ids: Vec<String> = edges.iter().map(|(id, _, _)| id.clone()).collect();
+        let edge_meta: std::collections::HashMap<String, (f64, Option<i64>)> = edges
+            .into_iter()
+            .map(|(id, w, last)| (id, (w, last)))
+            .collect();
 
         let mem_repo = MemoryRepo {
             writer: self.writer,
@@ -992,26 +1079,30 @@ impl<'a> AssociationRepo<'a> {
         Ok(mems
             .into_iter()
             .filter_map(|m| {
-                let strength = *weights.get(&m.id)?;
+                let (strength, last_co) = *edge_meta.get(&m.id)?;
                 Some(LinkedMemory {
                     memory: m,
                     link_strength: strength,
+                    last_co_retrieval: last_co,
                 })
             })
             .collect())
     }
 
     /// Lightweight neighbor query for graph-walking algorithms (bridge
-    /// BFS). Returns `(target_id, weight)` pairs without joining
-    /// through `memories` — just the edges. Sorted by weight desc so
-    /// strong edges are visited first.
+    /// BFS, graph expansion). Returns one `NeighborEdge` per outgoing
+    /// edge — the data needed to apply Eq 10 read-side decay
+    /// `w * exp(-Δt_days / 90)`. Sorted by stored weight desc so the
+    /// strongest edges are visited first; the caller may re-sort by
+    /// decayed weight if order matters after decay.
     pub async fn neighbor_edges(
         &self,
         source_id: &str,
         min_weight: f64,
-    ) -> Result<Vec<(String, f64)>, sqlx::Error> {
+    ) -> Result<Vec<NeighborEdge>, sqlx::Error> {
         sqlx::query_as(
-            "SELECT target_memory_id, weight FROM associations
+            "SELECT target_memory_id AS target_id, weight, last_co_retrieval
+             FROM associations
              WHERE source_memory_id = ? AND weight >= ?
              ORDER BY weight DESC",
         )

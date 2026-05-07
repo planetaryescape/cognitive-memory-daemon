@@ -43,6 +43,10 @@ pub struct LifecycleConfig {
     pub core_access_threshold: u64,
     pub core_stability_threshold: f64,
     pub core_session_threshold: usize,
+    /// Time constant for association edge decay (paper Eq 10).
+    /// SDK default: 90 days. Mirrors
+    /// `association_decay_constant_days` in types.py.
+    pub association_decay_constant_days: f64,
 }
 
 impl Default for LifecycleConfig {
@@ -61,6 +65,7 @@ impl Default for LifecycleConfig {
             core_access_threshold: 10,
             core_stability_threshold: 0.85,
             core_session_threshold: 3,
+            association_decay_constant_days: 90.0,
         }
     }
 }
@@ -112,6 +117,23 @@ pub fn parse_category(s: &str) -> Category {
         "core" => Category::Core,
         _ => Category::Semantic,
     }
+}
+
+/// Apply read-side decay to an association edge weight (paper Eq 10):
+/// `w' = w * exp(-Δt_days / τ)`. SDK default `τ = 90` days
+/// (`association_decay_constant_days` in cognitive_memory/types.py).
+///
+/// `last_co_retrieval` and `now` are unix seconds. Negative Δt is
+/// clamped to 0 (defensive: clock skew shouldn't increase weight).
+/// Mirrors `decay_association` in engine.py:217-229.
+pub fn decay_association_weight(
+    stored_weight: f64,
+    last_co_retrieval: i64,
+    now: i64,
+    tau_days: f64,
+) -> f64 {
+    let dt_days = ((now - last_co_retrieval).max(0) as f64) / 86_400.0;
+    stored_weight * (-dt_days / tau_days).exp()
 }
 
 /// Initial stability for a freshly-created memory: `0.1 + 0.3 * importance`.

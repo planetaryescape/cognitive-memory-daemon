@@ -14,7 +14,7 @@ mod searcher;
 
 pub use cosine::cosine_similarity;
 pub use hybrid::{reciprocal_rank_fusion, RankedHit};
-pub use searcher::{SearchOptions, SearchResult, Searcher};
+pub use searcher::{ResultSource, SearchOptions, SearchResult, Searcher};
 
 /// Errors surfaced by the search layer.
 #[derive(Debug, thiserror::Error)]

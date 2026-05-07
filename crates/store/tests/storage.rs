@@ -58,7 +58,7 @@ async fn re_running_migrations_is_idempotent() {
     // After every migration in the engine has been applied, the row count
     // equals the number of declared migrations. Adding a migration bumps
     // this expectation in lockstep with the constant `MIGRATIONS` slice.
-    let expected_migrations = 4_i64;
+    let expected_migrations = 5_i64;
     assert_eq!(
         count_before.0, expected_migrations,
         "expected one row per declared migration"
@@ -98,6 +98,158 @@ async fn pragmas_wal_and_foreign_keys_are_enabled() {
         .await
         .unwrap();
     assert_eq!(fk_on, 1, "foreign_keys must be ON");
+}
+
+/// `AssociationRepo::strengthen_pairs` UPSERTs bidirectional weights
+/// in one transaction. Mirrors SDK engine.py:621-625 + core.py:258-262.
+/// Pre-existing edge weight 0.4 + bump 0.1 → 0.5; new edges → 0.1.
+/// Both directions get last_co_retrieval = now.
+#[tokio::test]
+async fn strengthen_pairs_bumps_bidirectional_weights_and_refreshes_last_co_retrieval() {
+    use cognitive_memory_store::{AssociationRepo, MemoryRepo, MemoryRow};
+
+    let store = Store::in_memory().await.unwrap();
+    let mem_repo = MemoryRepo::new(&store);
+    let assoc_repo = AssociationRepo::new(&store);
+
+    for id in ["m_a", "m_b", "m_c"] {
+        mem_repo
+            .insert(&MemoryRow::new_minimal(
+                id, "alice", "x", "semantic", "fact", 100,
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Pre-existing A↔B at weight 0.4, last_co_retrieval=100.
+    assoc_repo
+        .create_or_strengthen("m_a", "m_b", 0.4, 100, "thematic")
+        .await
+        .unwrap();
+    assoc_repo
+        .create_or_strengthen("m_b", "m_a", 0.4, 100, "thematic")
+        .await
+        .unwrap();
+
+    let pairs = vec![
+        ("m_a".to_string(), "m_b".to_string()),
+        ("m_a".to_string(), "m_c".to_string()),
+    ];
+    let now: i64 = 999;
+    assoc_repo
+        .strengthen_pairs(&pairs, 0.1, now, "co-retrieval")
+        .await
+        .unwrap();
+
+    async fn fetch_edge(store: &Store, src: &str, tgt: &str) -> (f64, i64) {
+        sqlx::query_as(
+            "SELECT weight, last_co_retrieval FROM associations
+             WHERE source_memory_id = ? AND target_memory_id = ?",
+        )
+        .bind(src)
+        .bind(tgt)
+        .fetch_one(store.reader())
+        .await
+        .unwrap()
+    }
+
+    let (w_ab, last_ab) = fetch_edge(&store, "m_a", "m_b").await;
+    assert!(
+        (w_ab - 0.5).abs() < 1e-6,
+        "A→B should be 0.4+0.1=0.5, got {w_ab}"
+    );
+    assert_eq!(last_ab, 999);
+
+    let (w_ba, last_ba) = fetch_edge(&store, "m_b", "m_a").await;
+    assert!(
+        (w_ba - 0.5).abs() < 1e-6,
+        "B→A bidirectional, expected 0.5, got {w_ba}"
+    );
+    assert_eq!(last_ba, 999);
+
+    let (w_ac, last_ac) = fetch_edge(&store, "m_a", "m_c").await;
+    assert!(
+        (w_ac - 0.1).abs() < 1e-6,
+        "A→C new edge, expected 0.1, got {w_ac}"
+    );
+    assert_eq!(last_ac, 999);
+
+    let (w_ca, last_ca) = fetch_edge(&store, "m_c", "m_a").await;
+    assert!(
+        (w_ca - 0.1).abs() < 1e-6,
+        "C→A new bidirectional, expected 0.1, got {w_ca}"
+    );
+    assert_eq!(last_ca, 999);
+}
+
+/// `AssociationRepo::neighbor_edges` returns `last_co_retrieval`
+/// alongside target_id and weight, so callers (graph expansion, BFS
+/// bridge) can apply Eq 10 decay (`w * exp(-Δt/90)`) at read time.
+#[tokio::test]
+async fn neighbor_edges_returns_last_co_retrieval_alongside_weight() {
+    use cognitive_memory_store::{AssociationRepo, MemoryRepo, MemoryRow};
+
+    let store = Store::in_memory().await.unwrap();
+    let mem_repo = MemoryRepo::new(&store);
+    let assoc_repo = AssociationRepo::new(&store);
+
+    // Two memories owned by the same user so we can link them.
+    for id in ["mem_a", "mem_b"] {
+        mem_repo
+            .insert(&MemoryRow::new_minimal(
+                id,
+                "alice",
+                "content",
+                "semantic",
+                "fact",
+                1_700_000_000,
+            ))
+            .await
+            .unwrap();
+    }
+    // Create a directed edge with `updated_at = 1_700_000_000`.
+    // The migration backfilled `last_co_retrieval = updated_at`, so
+    // the edge's last_co_retrieval should match.
+    assoc_repo
+        .create_or_strengthen("mem_a", "mem_b", 0.7, 1_700_000_000, "thematic")
+        .await
+        .unwrap();
+
+    let edges = assoc_repo
+        .neighbor_edges("mem_a", 0.0)
+        .await
+        .expect("neighbor_edges");
+
+    assert_eq!(edges.len(), 1, "exactly one outgoing edge");
+    let edge = &edges[0];
+    assert_eq!(edge.target_id, "mem_b");
+    assert!((edge.weight - 0.7).abs() < 1e-6);
+    assert_eq!(
+        edge.last_co_retrieval,
+        Some(1_700_000_000),
+        "last_co_retrieval must be returned (defaulted to updated_at on insert)"
+    );
+}
+
+/// Migration v5 adds `last_co_retrieval` to the associations table so
+/// the SDK's Eq 10 read-side decay (`w * exp(-Δt/90)`) has a per-edge
+/// timestamp to compute Δt against.
+#[tokio::test]
+async fn migration_v5_adds_last_co_retrieval_column_to_associations() {
+    let store = Store::in_memory().await.unwrap();
+    // PRAGMA table_info returns one row per column with the column
+    // name in position 1. We assert that `last_co_retrieval` is in
+    // the resulting set.
+    let rows: Vec<(i64, String, String, i64, Option<String>, i64)> =
+        sqlx::query_as("PRAGMA table_info('associations')")
+            .fetch_all(store.reader())
+            .await
+            .unwrap();
+    let names: Vec<String> = rows.into_iter().map(|r| r.1).collect();
+    assert!(
+        names.iter().any(|n| n == "last_co_retrieval"),
+        "associations must have last_co_retrieval column post-v5; got {names:?}"
+    );
 }
 
 /// Behaviour 8 + 9 + 10: MemoryRepo round-trips a memory by user_id, returns
@@ -205,7 +357,7 @@ async fn reopening_file_backed_store_does_not_duplicate_migration_rows() {
             .fetch_one(store.reader())
             .await
             .unwrap();
-        assert_eq!(count.0, 4, "v1 + v2 + v3 + v4 migrations applied");
+        assert_eq!(count.0, 5, "v1 + v2 + v3 + v4 + v5 migrations applied");
         // Drop the store; pools close.
     }
 
@@ -216,7 +368,7 @@ async fn reopening_file_backed_store_does_not_duplicate_migration_rows() {
         .await
         .unwrap();
     assert_eq!(
-        count_again.0, 4,
+        count_again.0, 5,
         "reopening must not duplicate migration rows"
     );
 }
@@ -285,7 +437,7 @@ fn migration_engine_is_idempotent_under_repeated_application() {
                         .fetch_one(store.reader())
                         .await
                         .unwrap();
-                    let expected = 4;
+                    let expected = 5;
                     if count.0 != expected {
                         return Err(proptest::test_runner::TestCaseError::fail(format!(
                             "expected {expected} migration rows, got {}",

@@ -11,7 +11,7 @@ mod repos;
 pub use pool::Store;
 pub use repos::{
     AssociationRepo, AssociationRow, EmbeddingCacheRepo, EventLogRepo, LinkedMemory, MemoryCounts,
-    MemoryFilters, MemoryRepo, MemoryRow, MemoryUpdate, SearchCandidate,
+    MemoryFilters, MemoryRepo, MemoryRow, MemoryUpdate, NeighborEdge, SearchCandidate,
 };
 
 /// Errors surfaced by the storage layer.

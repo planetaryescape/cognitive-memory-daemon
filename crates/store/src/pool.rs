@@ -279,6 +279,18 @@ CREATE TABLE conflict_queue (
 CREATE INDEX idx_conflict_queue_user ON conflict_queue(user_id, queued_at);
 "#;
 
+/// `last_co_retrieval` per association edge — the timestamp the SDK
+/// uses to apply Eq 10's read-side decay `w * exp(-Δt_days/90)`.
+/// Backfilled to `updated_at` (the closest existing analogue) so
+/// pre-migration edges decay from their last write rather than
+/// "infinity ago". Index on the column for find-fading style scans.
+const MIGRATION_V5_ASSOCIATION_LAST_CO_RETRIEVAL: &str = r#"
+ALTER TABLE associations ADD COLUMN last_co_retrieval INTEGER;
+UPDATE associations SET last_co_retrieval = updated_at;
+CREATE INDEX idx_associations_last_co_retrieval
+    ON associations(last_co_retrieval);
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -299,5 +311,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "conflict_queue",
         sql: MIGRATION_V4_CONFLICT_QUEUE,
+    },
+    Migration {
+        version: 5,
+        name: "association_last_co_retrieval",
+        sql: MIGRATION_V5_ASSOCIATION_LAST_CO_RETRIEVAL,
     },
 ];

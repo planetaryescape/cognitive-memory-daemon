@@ -7,8 +7,8 @@
 
 use crate::{cosine_similarity, SearchError};
 use cognitive_memory_lifecycle::{
-    base_decay_rate_for_category, compute_retention, parse_category, DecayModel, LifecycleConfig,
-    MemoryState,
+    base_decay_rate_for_category, compute_retention, decay_association_weight, parse_category,
+    DecayModel, LifecycleConfig, MemoryState,
 };
 use cognitive_memory_store::{AssociationRepo, MemoryRepo, SearchCandidate, Store};
 
@@ -38,6 +38,18 @@ fn search_lifecycle_config() -> LifecycleConfig {
     }
 }
 
+/// How a memory entered the result set. Drives differential
+/// post-retrieval boosts: direct hits get the +0.1 stability bump
+/// (paper Eq 6), graph-expanded hits get the smaller +0.03 (Eq 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultSource {
+    /// The memory was a top-K cosine hit on the query embedding.
+    Direct,
+    /// The memory was added to the result set via association-graph
+    /// expansion from a direct hit.
+    GraphExpanded,
+}
+
 /// One result row returned by `Searcher::search`.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -45,9 +57,14 @@ pub struct SearchResult {
     pub content: String,
     pub category: String,
     pub memory_type: String,
-    /// Composite score: cosine similarity in v1; multiplied by `R^alpha`
-    /// once the lifecycle layer is wired in (Phase 8).
+    /// Composite score: `relevance(m, q) * R(m)^α [* edge_weight]`.
+    /// Equation 4 for direct hits; Equation 4 multiplied by edge
+    /// weight for graph-expanded hits.
     pub score: f32,
+    /// Whether this hit came from dense/hybrid search or graph
+    /// expansion. Read by the handler to decide which stability
+    /// boost amount to apply per the paper's Eq 6 vs Eq 8.
+    pub source: ResultSource,
 }
 
 /// Knobs the caller can pass to `Searcher::search`.
@@ -164,6 +181,7 @@ impl<'a> Searcher<'a> {
                 category: candidate.category,
                 memory_type: candidate.memory_type,
                 score: composite as f32,
+                source: ResultSource::Direct,
             });
         }
 
@@ -264,6 +282,12 @@ impl<'a> Searcher<'a> {
             .map(|r| r.memory_id.clone())
             .collect();
 
+        // We pull the linked set with the *stored* weight ≥ min, then
+        // re-check after decay below. This means an edge that's stored
+        // ≥0.3 but has decayed under 0.3 will be dropped at the
+        // post-decay check. Pulling with min_weight=0 would be more
+        // permissive but waste fetches; using the stored threshold as
+        // an upper bound is conservative — see the decay-threshold test.
         for _hop in 0..options.graph_expansion_hops {
             if frontier_ids.is_empty() {
                 break;
@@ -274,6 +298,21 @@ impl<'a> Searcher<'a> {
             let mut next_frontier = Vec::new();
             for lm in linked {
                 if already_have.contains(&lm.memory.id) {
+                    continue;
+                }
+                // Apply Eq 10 read-side decay before the threshold
+                // check. Edges with old `last_co_retrieval` whose
+                // decayed weight falls below the threshold are skipped.
+                let live_weight = match lm.last_co_retrieval {
+                    Some(last) => decay_association_weight(
+                        lm.link_strength,
+                        last,
+                        options.now,
+                        life_cfg.association_decay_constant_days,
+                    ),
+                    None => lm.link_strength,
+                };
+                if live_weight < options.min_bridge_edge_weight {
                     continue;
                 }
                 let Some(emb_bytes) = &lm.memory.embedding else {
@@ -301,7 +340,7 @@ impl<'a> Searcher<'a> {
                     category: parse_category(&lm.memory.category),
                 };
                 let retention = compute_retention(&state, options.now, life_cfg);
-                let composite = sim * retention.powf(alpha) * lm.link_strength;
+                let composite = sim * retention.powf(alpha) * live_weight;
 
                 scored.push(SearchResult {
                     memory_id: lm.memory.id.clone(),
@@ -309,6 +348,7 @@ impl<'a> Searcher<'a> {
                     category: lm.memory.category.clone(),
                     memory_type: lm.memory.memory_type.clone(),
                     score: composite as f32,
+                    source: ResultSource::GraphExpanded,
                 });
                 already_have.insert(lm.memory.id.clone());
                 next_frontier.push(lm.memory.id);
@@ -384,7 +424,8 @@ async fn bfs_path(
             continue;
         }
         let edges = assoc_repo.neighbor_edges(&current, min_weight).await?;
-        for (neighbor, _weight) in edges {
+        for edge in edges {
+            let neighbor = edge.target_id;
             if visited.contains(&neighbor) {
                 continue;
             }
