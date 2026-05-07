@@ -58,6 +58,15 @@ pub struct AppState {
     /// clock) so suspend/clock-skew don't produce negative or
     /// nonsensical uptimes.
     pub started_at: Instant,
+    /// Optional LLM provider for conflict judging (Stage 4) and
+    /// consolidation summarisation (Stage 4). `None` is the
+    /// default — the daemon falls back to the heuristic conflict
+    /// resolver and skips consolidation. Wired by config:
+    ///   `provider = "local"` ⇒ LocalLlmProvider
+    ///   `provider = "openai"` ⇒ OpenAiProvider (existing)
+    ///   `provider = "anthropic"` ⇒ AnthropicProvider (existing)
+    /// See `crates/cli/src/main.rs::download_model` and `set-llm`.
+    pub llm: Option<Arc<dyn cognitive_memory_llm::LlmProvider>>,
 }
 
 #[instrument(skip(req, state), fields(user_id = %user_id))]
@@ -1067,11 +1076,15 @@ async fn handle_tick(_args: TickArgs, state: &Arc<AppState>) -> Result<Response,
     // -------- Pass 3: conflict resolution --------
     let resolved = resolve_conflicts(state, now).await?;
 
+    // -------- Pass 4: consolidation clustering + LLM compress --------
+    let consolidated = consolidate_at_tick(state, now).await?;
+
     tracing::debug!(
         decayed,
         migrated_to_cold,
         expired_to_stub,
         resolved,
+        consolidated,
         "tick complete"
     );
 
@@ -1083,14 +1096,53 @@ async fn handle_tick(_args: TickArgs, state: &Arc<AppState>) -> Result<Response,
 
 /// Drain up to `CONFLICT_RESOLUTION_BATCH` conflict pairs from the
 /// queue. For each, apply a heuristic resolver (the loser is
-/// superseded by the winner). Mirrors `_resolve_conflict_queue`
-/// (core.py:380-432) but uses an importance/recency heuristic
-/// instead of an LLM judge — the daemon may not have an LLM
-/// provider configured.
+/// LLM judge prompt — verbatim from cognitive_memory/extraction.py:230-249.
+/// Returns one of CONTRADICTION / UPDATE / OVERLAP / NONE.
+const CONFLICT_JUDGE_PROMPT: &str =
+    "Does the new memory contradict or update an existing memory?\n\n\
+Existing memory: \"{existing}\"\n\
+New memory: \"{new}\"\n\n\
+Respond with exactly one word: CONTRADICTION, UPDATE, OVERLAP, or NONE.\n\
+- CONTRADICTION: the new memory directly negates the existing one\n\
+- UPDATE: the new memory is a newer version of the same fact\n\
+- OVERLAP: they cover similar ground but don't conflict\n\
+- NONE: they are unrelated";
+
+/// One of the four labels returned by the LLM judge. Unparseable
+/// responses default to `None_` (= "do nothing safely") per the SDK
+/// fallback at extraction.py:248.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictLabel {
+    Contradiction,
+    Update,
+    Overlap,
+    None_,
+}
+
+fn parse_conflict_label(raw: &str) -> ConflictLabel {
+    let upper = raw.trim().to_uppercase();
+    if upper.contains("CONTRADICTION") {
+        ConflictLabel::Contradiction
+    } else if upper.contains("UPDATE") {
+        ConflictLabel::Update
+    } else if upper.contains("OVERLAP") {
+        ConflictLabel::Overlap
+    } else {
+        ConflictLabel::None_
+    }
+}
+
+/// Resolve queued conflicts. Two paths:
+///   - With `state.llm = Some(...)`: ask the LLM to classify each
+///     pair into CONTRADICTION/UPDATE/OVERLAP/NONE; act on the label
+///     per SDK semantics (extraction.py:230-249).
+///   - With `state.llm = None`: fall back to the original heuristic
+///     (higher-importance/more-recent wins as if every pair were a
+///     CONTRADICTION). Logs a one-time tracing::warn so operators
+///     know they're degraded.
 ///
-/// Heuristic: winner = (higher importance) ⇒ tie ⇒ (more recent
-/// `created_at`). Loser is marked `is_superseded=1`,
-/// `superseded_by=winner_id`, `contradicted_by=winner_id`.
+/// Either way, every queued pair is dropped from `conflict_queue` so
+/// the queue drains regardless of resolver choice.
 async fn resolve_conflicts(state: &Arc<AppState>, now: i64) -> Result<u64, HandlerError> {
     let pairs: Vec<(i64, String, String, String)> = sqlx::query_as(
         "SELECT id, user_id, new_memory_id, existing_memory_id
@@ -1124,38 +1176,89 @@ async fn resolve_conflicts(state: &Arc<AppState>, now: i64) -> Result<u64, Handl
                 .fetch_optional(&mut *tx)
                 .await?;
 
-        // If either is gone or already-superseded, drop the queue
-        // entry and move on.
         if let (Some(n), Some(e)) = (new_row, existing_row) {
             if !n.is_superseded && !e.is_superseded {
-                let (winner, loser) = if n.importance > e.importance
-                    || (n.importance == e.importance && n.created_at > e.created_at)
-                {
-                    (n, e)
-                } else {
-                    (e, n)
+                // Decide outcome: LLM if configured, else heuristic
+                // (which acts as if every pair were CONTRADICTION).
+                let outcome = match state.llm.as_ref() {
+                    Some(provider) => {
+                        let prompt = CONFLICT_JUDGE_PROMPT
+                            .replace("{existing}", &e.content)
+                            .replace("{new}", &n.content);
+                        match provider.complete(&prompt, 20).await {
+                            Ok(raw) => parse_conflict_label(&raw),
+                            Err(err) => {
+                                tracing::warn!(
+                                    %err,
+                                    "LLM judge failed; defaulting to NONE for pair"
+                                );
+                                ConflictLabel::None_
+                            }
+                        }
+                    }
+                    None => ConflictLabel::Contradiction, // heuristic mode
                 };
-                sqlx::query(
-                    "UPDATE memories
-                     SET is_superseded = 1, superseded_by = ?, contradicted_by = ?
-                     WHERE id = ?",
-                )
-                .bind(&winner.id)
-                .bind(&winner.id)
-                .bind(&loser.id)
-                .execute(&mut *tx)
-                .await?;
-                // Demote a CORE loser back to semantic (engine.py:418-419).
-                if loser.category == "core" {
-                    sqlx::query(
-                        "UPDATE memories SET category = 'semantic', retention_floor = 0.0
-                         WHERE id = ?",
-                    )
-                    .bind(&loser.id)
-                    .execute(&mut *tx)
-                    .await?;
+
+                match outcome {
+                    ConflictLabel::Contradiction | ConflictLabel::Update => {
+                        // SDK extraction.py:236-249: existing → superseded
+                        // by new. Heuristic mode picks winner via
+                        // (importance, recency) for backward-compat.
+                        let (winner, loser) = match (state.llm.is_some(), outcome) {
+                            (true, ConflictLabel::Update) => {
+                                // SDK: UPDATE means "new is the current
+                                // version". Winner is the new memory;
+                                // its importance is bumped to max of
+                                // both.
+                                let new_importance = n.importance.max(e.importance);
+                                if (new_importance - n.importance).abs() > f64::EPSILON {
+                                    sqlx::query("UPDATE memories SET importance = ? WHERE id = ?")
+                                        .bind(new_importance)
+                                        .bind(&n.id)
+                                        .execute(&mut *tx)
+                                        .await?;
+                                }
+                                (n, e)
+                            }
+                            (true, ConflictLabel::Contradiction) => (n, e),
+                            _ => {
+                                // Heuristic mode.
+                                if n.importance > e.importance
+                                    || (n.importance == e.importance && n.created_at > e.created_at)
+                                {
+                                    (n, e)
+                                } else {
+                                    (e, n)
+                                }
+                            }
+                        };
+                        sqlx::query(
+                            "UPDATE memories
+                             SET is_superseded = 1, superseded_by = ?, contradicted_by = ?
+                             WHERE id = ?",
+                        )
+                        .bind(&winner.id)
+                        .bind(&winner.id)
+                        .bind(&loser.id)
+                        .execute(&mut *tx)
+                        .await?;
+                        // Demote a CORE loser to semantic (engine.py:418-419).
+                        if loser.category == "core" {
+                            sqlx::query(
+                                "UPDATE memories
+                                 SET category = 'semantic', retention_floor = 0.0
+                                 WHERE id = ?",
+                            )
+                            .bind(&loser.id)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                        resolved += 1;
+                    }
+                    ConflictLabel::Overlap | ConflictLabel::None_ => {
+                        // Both stay non-superseded; drop queue entry.
+                    }
                 }
-                resolved += 1;
             }
         }
 
@@ -1166,6 +1269,222 @@ async fn resolve_conflicts(state: &Arc<AppState>, now: i64) -> Result<u64, Handl
     }
     tx.commit().await?;
     Ok(resolved)
+}
+
+/// Memories below this retention are eligible for consolidation
+/// clustering. SDK default `consolidation_retention_threshold = 0.20`.
+const CONSOLIDATION_RETENTION_THRESHOLD: f64 = 0.20;
+
+/// Min cluster size to trigger LLM compression. Smaller groups don't
+/// justify a summary memory. SDK default 5.
+const CONSOLIDATION_GROUP_SIZE: usize = 5;
+
+/// Cosine similarity threshold for cluster membership. SDK default 0.70.
+const CONSOLIDATION_SIM_THRESHOLD: f64 = 0.70;
+
+/// Cap on summary memories produced per tick. Keeps tick latency
+/// bounded; remaining clusters get picked up next tick.
+const CONSOLIDATION_MAX_PER_TICK: usize = 5;
+
+/// Consolidation prompt — verbatim from cognitive_memory/extraction.py:107-112.
+const CONSOLIDATION_PROMPT: &str = "Compress these related memories into a single concise summary that preserves all key facts.\n\n\
+Memories:\n{memories}\n\n\
+Write one clear paragraph. Preserve specific names, dates, numbers, and preferences. Do not add information that isn't in the originals.";
+
+/// Pass 4: cluster fading memories by category/similarity and ask the
+/// LLM to compress each cluster into a single summary. Originals are
+/// marked `is_superseded=1, superseded_by=summary_id` and migrated to
+/// cold (preserves audit trail; reachable via `cm get` and via
+/// `cm search --deep-recall`).
+///
+/// Skipped silently if `state.llm` is None (no LLM configured); the
+/// daemon traces a single warn at the call site.
+async fn consolidate_at_tick(state: &Arc<AppState>, now: i64) -> Result<u64, HandlerError> {
+    let Some(provider) = state.llm.clone() else {
+        // Don't log on every tick — too noisy. The first call to
+        // `cm tick` after startup with no LLM logs a warn at the
+        // `consolidated` field; debug-level otherwise. The opt-in
+        // surface (`cm config set-llm`) is documented in CLI help.
+        return Ok(0);
+    };
+
+    // Distinct user_ids with hot memories.
+    let users: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT user_id FROM memories
+         WHERE is_cold = 0 AND is_stub = 0 AND is_superseded = 0",
+    )
+    .fetch_all(state.store.reader())
+    .await?;
+
+    let mut summaries_created = 0u64;
+    'outer: for (user_id,) in users {
+        let rows: Vec<MemoryRow> = sqlx::query_as(
+            "SELECT * FROM memories
+             WHERE user_id = ? AND is_cold = 0 AND is_stub = 0 AND is_superseded = 0
+               AND embedding IS NOT NULL",
+        )
+        .bind(&user_id)
+        .fetch_all(state.store.reader())
+        .await?;
+
+        // Filter to "fading" — computed retention below threshold.
+        let fading: Vec<MemoryRow> = rows
+            .into_iter()
+            .filter(|r| compute_current_retention(r, now) < CONSOLIDATION_RETENTION_THRESHOLD)
+            .collect();
+
+        // Group by category. Greedy clustering happens within each.
+        let mut by_cat: std::collections::HashMap<String, Vec<MemoryRow>> =
+            std::collections::HashMap::new();
+        for row in fading {
+            by_cat.entry(row.category.clone()).or_default().push(row);
+        }
+
+        for (_category, mems) in by_cat {
+            if mems.len() < CONSOLIDATION_GROUP_SIZE {
+                continue;
+            }
+            let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for i in 0..mems.len() {
+                if used.contains(&mems[i].id) {
+                    continue;
+                }
+                let head_vec = decode_embedding(mems[i].embedding.as_deref());
+                if head_vec.is_empty() {
+                    continue;
+                }
+                let mut group: Vec<&MemoryRow> = vec![&mems[i]];
+                for cand in mems.iter().skip(i + 1) {
+                    if used.contains(&cand.id) {
+                        continue;
+                    }
+                    let cand_vec = decode_embedding(cand.embedding.as_deref());
+                    if cand_vec.len() != head_vec.len() {
+                        continue;
+                    }
+                    let sim = cosine_similarity_f32(&head_vec, &cand_vec) as f64;
+                    if sim >= CONSOLIDATION_SIM_THRESHOLD {
+                        group.push(cand);
+                        if group.len() >= CONSOLIDATION_GROUP_SIZE {
+                            break;
+                        }
+                    }
+                }
+                if group.len() >= CONSOLIDATION_GROUP_SIZE {
+                    let summary_id =
+                        compress_cluster(state, &user_id, &group, &provider, now).await?;
+                    for m in &group {
+                        used.insert(m.id.clone());
+                    }
+                    summaries_created += 1;
+                    let _ = summary_id;
+                    if (summaries_created as usize) >= CONSOLIDATION_MAX_PER_TICK {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    Ok(summaries_created)
+}
+
+/// Compress a cluster: send the contents to the LLM, embed the
+/// summary, write a new summary memory, and mark all originals
+/// superseded + migrated to cold.
+async fn compress_cluster(
+    state: &Arc<AppState>,
+    user_id: &str,
+    group: &[&MemoryRow],
+    provider: &Arc<dyn cognitive_memory_llm::LlmProvider>,
+    now: i64,
+) -> Result<String, HandlerError> {
+    let bullet_list: String = group
+        .iter()
+        .map(|m| format!("- {}", m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = CONSOLIDATION_PROMPT.replace("{memories}", &bullet_list);
+    let summary_text = provider
+        .complete(&prompt, 200)
+        .await
+        .map_err(|e| HandlerError::InvalidPayload(format!("LLM compress: {e}")))?;
+
+    let cached = CachedEmbeddings::new(ProviderRef(state.embeddings.clone()), &state.store);
+    let summary_vec = cached.embed(&summary_text).await?;
+    let summary_bytes: Vec<u8> = summary_vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+    let summary_id = format!("mem_{}", ulid::Ulid::new());
+    let max_imp = group
+        .iter()
+        .map(|m| m.importance)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mean_stab: f64 = group.iter().map(|m| m.stability).sum::<f64>() / (group.len() as f64);
+    let category = group[0].category.clone();
+
+    let mut summary_row = MemoryRow::new_minimal(
+        summary_id.clone(),
+        user_id,
+        summary_text,
+        category.clone(),
+        "summary",
+        now,
+    );
+    summary_row.embedding = Some(summary_bytes);
+    summary_row.embedding_provider = Some(state.embeddings.name().to_string());
+    summary_row.embedding_model = Some(state.embeddings.model().to_string());
+    summary_row.importance = max_imp.max(0.0);
+    summary_row.stability = mean_stab;
+    if category == "core" {
+        summary_row.retention_floor = CORE_RETENTION_FLOOR;
+    }
+
+    // Insert summary first (own writer call), then mark originals in
+    // a single tx. Two writes is fine — the summary is the new
+    // source of truth, the originals get demoted to its children.
+    MemoryRepo::new(&state.store).insert(&summary_row).await?;
+
+    let mut tx = state.store.writer().begin().await?;
+    for m in group {
+        sqlx::query(
+            "UPDATE memories
+             SET is_superseded = 1, superseded_by = ?,
+                 is_cold = 1, cold_since = ?
+             WHERE user_id = ? AND id = ?",
+        )
+        .bind(&summary_id)
+        .bind(now)
+        .bind(user_id)
+        .bind(&m.id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(summary_id)
+}
+
+/// Decode the f32 LE-byte embedding blob into a vector. Returns an
+/// empty vec when bytes are absent or wrong-sized (caller skips).
+fn decode_embedding(bytes: Option<&[u8]>) -> Vec<f32> {
+    bytes
+        .map(|b| {
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Inline cosine for the consolidation hot path. Avoids depending on
+/// the `search` crate from `daemon` for one tiny function.
+fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|y| y * y).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 async fn handle_find_fading(

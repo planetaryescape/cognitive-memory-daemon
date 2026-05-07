@@ -56,9 +56,16 @@ pub struct ExtractedMemory {
     pub memory_type: String,
 }
 
-/// LLM provider abstraction. Implementations must be deterministic given
-/// the same `transcript` (with no api-key-override semantic difference);
-/// the cache layer over this trait depends on that contract.
+/// LLM provider abstraction. Two capabilities:
+///   1. `extract` — structured memory extraction from a transcript.
+///   2. `complete` — generic prompt-in / text-out, used by the conflict
+///      judge and consolidation summariser. Default impl returns
+///      Provider("complete not implemented") so existing impls keep
+///      compiling; the new `LocalLlmProvider` and `FakeLlmProvider`
+///      override it.
+///
+/// Implementations must be deterministic given the same input; the
+/// cache layer depends on it.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &str;
@@ -66,6 +73,14 @@ pub trait LlmProvider: Send + Sync {
     /// Run an extraction over `transcript`. Returns zero or more
     /// extracted memory candidates.
     async fn extract(&self, req: ExtractionRequest<'_>) -> Result<Vec<ExtractedMemory>, LlmError>;
+    /// Generic completion — used for short structured tasks like the
+    /// 4-label conflict judge and the consolidation paragraph
+    /// summariser. Default = unimplemented; opt-in per provider.
+    async fn complete(&self, _prompt: &str, _max_tokens: usize) -> Result<String, LlmError> {
+        Err(LlmError::Provider(
+            "complete() not implemented for this provider".to_string(),
+        ))
+    }
 }
 
 /// Cache key for an extraction call.

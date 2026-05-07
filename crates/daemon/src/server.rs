@@ -45,12 +45,27 @@ impl Daemon {
     /// responsible for opening the `Store` and choosing the embedding
     /// provider; the daemon's job is to accept connections and dispatch.
     pub fn new(store: Store, embeddings: Arc<dyn EmbeddingProvider>, socket_path: PathBuf) -> Self {
+        Self::new_with_llm(store, embeddings, socket_path, None)
+    }
+
+    /// Variant that wires an optional LLM provider into `AppState`.
+    /// `None` keeps the daemon in heuristic-fallback mode for conflict
+    /// resolution and disables consolidation summarisation. `Some`
+    /// enables LLM-judged conflict resolution and consolidation per
+    /// the SDK's `engine.tick()` pipeline (Stage 4 of the plan).
+    pub fn new_with_llm(
+        store: Store,
+        embeddings: Arc<dyn EmbeddingProvider>,
+        socket_path: PathBuf,
+        llm: Option<Arc<dyn cognitive_memory_llm::LlmProvider>>,
+    ) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
         let state = Arc::new(AppState {
             store,
             embeddings,
             request_semaphore: Arc::new(Semaphore::new(REQUEST_CONCURRENCY_LIMIT)),
             started_at: Instant::now(),
+            llm,
         });
         Self {
             state,

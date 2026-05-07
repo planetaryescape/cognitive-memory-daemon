@@ -47,6 +47,33 @@ async fn boot_daemon_with_embeddings() -> (
     TempDir,
     Arc<FakeEmbeddingProvider>,
 ) {
+    boot_daemon_full(None).await
+}
+
+/// Variant that wires both the embeddings AND a scripted LLM
+/// provider into the daemon. Used by Stage 4 conflict-judge and
+/// consolidation tests to drive deterministic outcomes.
+async fn boot_daemon_with_llm(
+    llm: Arc<dyn cognitive_memory_llm::LlmProvider>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    PathBuf,
+    tokio::sync::broadcast::Sender<()>,
+    TempDir,
+    Arc<FakeEmbeddingProvider>,
+) {
+    boot_daemon_full(Some(llm)).await
+}
+
+async fn boot_daemon_full(
+    llm: Option<Arc<dyn cognitive_memory_llm::LlmProvider>>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    PathBuf,
+    tokio::sync::broadcast::Sender<()>,
+    TempDir,
+    Arc<FakeEmbeddingProvider>,
+) {
     let tmp = TempDir::new().unwrap();
     let socket_path = tmp.path().join("cm.sock");
     let db_path = tmp.path().join("data.db");
@@ -55,7 +82,7 @@ async fn boot_daemon_with_embeddings() -> (
     let embeddings = Arc::new(FakeEmbeddingProvider::new("local", "fake-16", 16));
     let embeddings_for_daemon: Arc<dyn cognitive_memory_embeddings::EmbeddingProvider> =
         embeddings.clone();
-    let daemon = Daemon::new(store, embeddings_for_daemon, socket_path.clone());
+    let daemon = Daemon::new_with_llm(store, embeddings_for_daemon, socket_path.clone(), llm);
     let shutdown = daemon.shutdown_handle();
 
     let handle = tokio::spawn(async move {
@@ -1498,6 +1525,719 @@ async fn restore_resets_days_at_floor_alongside_is_cold() {
     assert!(!m.is_cold);
     assert!(m.cold_since.is_none());
     assert_eq!(m.days_at_floor, 0, "all three cold-state fields reset");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+// ===========================================================================
+// Stage 4 — LLM conflict judge
+// ===========================================================================
+//
+// All conflict-judge tests use FakeLlmProvider with a scripted
+// response queue so the SDK extraction.py:230-249 prompt → label
+// flow runs deterministically. The real LocalLlmProvider impl has
+// its own integration test in crates/llm.
+
+/// Set up: store two near-duplicate memories so the ingest path
+/// queues a conflict. Returns (anchor_id, near_dup_id, store_path).
+/// The caller chooses an LLM (or None) at boot to dictate the
+/// resolution outcome.
+async fn setup_conflict_pair(
+    client: &mut Client,
+    embeddings: &Arc<FakeEmbeddingProvider>,
+    anchor_text: &str,
+    near_dup_text: &str,
+) -> (String, String) {
+    // cosine ≈ 0.90 — well into the conflict band.
+    let mut v1 = vec![0.0f32; 16];
+    v1[0] = 1.0;
+    let mut v2 = vec![0.0f32; 16];
+    v2[0] = 0.9;
+    v2[1] = (0.19f32).sqrt();
+    embeddings.set_override(anchor_text.to_string(), v1);
+    embeddings.set_override(near_dup_text.to_string(), v2);
+
+    let anchor_id = store_helper(client, anchor_text, "semantic").await;
+    let near_dup_id = store_helper(client, near_dup_text, "semantic").await;
+    (anchor_id, near_dup_id)
+}
+
+async fn read_supersession(store: &Store, id: &str) -> (bool, Option<String>, Option<String>) {
+    let row: (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT is_superseded, superseded_by, contradicted_by
+         FROM memories WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(store.reader())
+    .await
+    .unwrap();
+    (row.0 != 0, row.1, row.2)
+}
+
+/// With `state.llm = None`, conflict resolution falls back to the
+/// existing heuristic (higher importance / more recent wins). This
+/// is the regression test — Stage 4 must NOT silently break the
+/// no-LLM path that earlier stages relied on.
+#[tokio::test]
+async fn conflict_resolution_with_no_llm_uses_heuristic() {
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_embeddings().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let (anchor_id, near_dup_id) = setup_conflict_pair(
+        &mut client,
+        &embeddings,
+        "user lives in Berlin since 2018",
+        "user lives in Paris since 2019",
+    )
+    .await;
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let (anchor_sup, _, _) = read_supersession(&store, &anchor_id).await;
+    let (near_sup, _, _) = read_supersession(&store, &near_dup_id).await;
+    drop(store);
+    // Heuristic: tie on importance (both 0.0) AND tie on created_at
+    // (both stored within the same wall-clock second). The
+    // strict-greater-than test in the heuristic falls through to
+    // `winner = e (anchor)` so near_dup ends up superseded. Either
+    // way, EXACTLY ONE of the pair should be superseded — that's
+    // the load-bearing claim, not which one.
+    assert!(
+        anchor_sup ^ near_sup,
+        "heuristic must supersede exactly one of the pair (got anchor={anchor_sup}, near={near_sup})"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// LLM returns "CONTRADICTION": existing → superseded by new.
+#[tokio::test]
+async fn conflict_resolution_with_llm_contradiction_supersedes_existing() {
+    let llm = Arc::new(
+        cognitive_memory_llm::FakeLlmProvider::new("fake", "fake-judge")
+            .with_responses(["CONTRADICTION"]),
+    ) as Arc<dyn cognitive_memory_llm::LlmProvider>;
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_llm(llm).await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let (anchor_id, near_dup_id) = setup_conflict_pair(
+        &mut client,
+        &embeddings,
+        "user is allergic to peanuts",
+        "user is not allergic to peanuts",
+    )
+    .await;
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let (anchor_sup, anchor_by, _) = read_supersession(&store, &anchor_id).await;
+    let (near_sup, _, _) = read_supersession(&store, &near_dup_id).await;
+    drop(store);
+    assert!(
+        anchor_sup,
+        "CONTRADICTION must supersede the existing memory"
+    );
+    assert_eq!(
+        anchor_by.as_deref(),
+        Some(near_dup_id.as_str()),
+        "superseded_by must point at the new winner"
+    );
+    assert!(!near_sup, "winner stays hot");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// LLM returns "UPDATE": existing → superseded by new, winner's
+/// importance is bumped to max(both).
+#[tokio::test]
+async fn conflict_resolution_with_llm_update_supersedes_and_bumps_importance() {
+    let llm = Arc::new(
+        cognitive_memory_llm::FakeLlmProvider::new("fake", "fake-judge").with_responses(["UPDATE"]),
+    ) as Arc<dyn cognitive_memory_llm::LlmProvider>;
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_llm(llm).await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    // Plant existing with importance=0.7 (high).
+    let mut v_anchor = vec![0.0f32; 16];
+    v_anchor[0] = 1.0;
+    let mut v_new = vec![0.0f32; 16];
+    v_new[0] = 0.9;
+    v_new[1] = (0.19f32).sqrt();
+    embeddings.set_override("user is 30 years old", v_anchor);
+    embeddings.set_override("user is 31 years old", v_new);
+
+    let anchor_resp = client
+        .request(Request::Memory(MemoryRequest::Store(StoreMemoryArgs {
+            user_id: "alice".to_string(),
+            content: "user is 30 years old".to_string(),
+            category: "semantic".to_string(),
+            memory_type: "fact".to_string(),
+            metadata: "{}".to_string(),
+            importance: Some(0.7),
+        })))
+        .await
+        .unwrap();
+    let anchor_id = match anchor_resp.data.unwrap() {
+        ResponseData::MemoryStored(s) => s.id,
+        _ => panic!(),
+    };
+    let near_dup_id = store_helper(&mut client, "user is 31 years old", "semantic").await;
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let (anchor_sup, _, _) = read_supersession(&store, &anchor_id).await;
+    assert!(anchor_sup, "UPDATE must supersede existing");
+    let (winner_imp,): (f64,) = sqlx::query_as("SELECT importance FROM memories WHERE id = ?")
+        .bind(&near_dup_id)
+        .fetch_one(store.reader())
+        .await
+        .unwrap();
+    drop(store);
+    assert!(
+        (winner_imp - 0.7).abs() < 1e-6,
+        "winner inherits max(importance), expected 0.7, got {winner_imp}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// LLM returns "OVERLAP": both stay non-superseded; queue drops.
+#[tokio::test]
+async fn conflict_resolution_with_llm_overlap_keeps_both() {
+    let llm = Arc::new(
+        cognitive_memory_llm::FakeLlmProvider::new("fake", "fake-judge")
+            .with_responses(["OVERLAP"]),
+    ) as Arc<dyn cognitive_memory_llm::LlmProvider>;
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_llm(llm).await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let (anchor_id, near_dup_id) = setup_conflict_pair(
+        &mut client,
+        &embeddings,
+        "user likes hiking",
+        "user went hiking yesterday",
+    )
+    .await;
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let (anchor_sup, _, _) = read_supersession(&store, &anchor_id).await;
+    let (near_sup, _, _) = read_supersession(&store, &near_dup_id).await;
+    let (queue_n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM conflict_queue")
+        .fetch_one(store.reader())
+        .await
+        .unwrap();
+    drop(store);
+    assert!(!anchor_sup, "OVERLAP keeps existing non-superseded");
+    assert!(!near_sup, "OVERLAP keeps new non-superseded");
+    assert_eq!(queue_n, 0, "queue must drain regardless of label");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// LLM returns "NONE": both stay non-superseded; queue drops.
+#[tokio::test]
+async fn conflict_resolution_with_llm_none_keeps_both() {
+    let llm = Arc::new(
+        cognitive_memory_llm::FakeLlmProvider::new("fake", "fake-judge").with_responses(["NONE"]),
+    ) as Arc<dyn cognitive_memory_llm::LlmProvider>;
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_llm(llm).await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let (anchor_id, near_dup_id) = setup_conflict_pair(
+        &mut client,
+        &embeddings,
+        "user prefers tea",
+        "user lives in Boston",
+    )
+    .await;
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let (a, _, _) = read_supersession(&store, &anchor_id).await;
+    let (b, _, _) = read_supersession(&store, &near_dup_id).await;
+    drop(store);
+    assert!(!a && !b, "NONE keeps both memories");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Garbage LLM response: parser falls back to NONE (= safe no-op).
+/// Mirrors SDK extraction.py:248 fallback.
+#[tokio::test]
+async fn conflict_resolution_with_unparseable_llm_response_falls_back_to_none() {
+    let llm = Arc::new(
+        cognitive_memory_llm::FakeLlmProvider::new("fake", "fake-judge")
+            .with_responses(["yes definitely conflicting"]),
+    ) as Arc<dyn cognitive_memory_llm::LlmProvider>;
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_llm(llm).await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let (anchor_id, _) =
+        setup_conflict_pair(&mut client, &embeddings, "fact a", "fact aaa similar").await;
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let (a, _, _) = read_supersession(&store, &anchor_id).await;
+    drop(store);
+    assert!(
+        !a,
+        "unparseable response must default to NONE (no supersession)"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// CORE loser on CONTRADICTION is demoted to SEMANTIC and its
+/// retention_floor reset to 0.0 (engine.py:418-419 parity). The
+/// elevated floor protects core memories from decay; demotion
+/// removes that protection so the contradicted memory can fade.
+#[tokio::test]
+async fn conflict_resolution_demotes_core_loser_to_semantic() {
+    let llm = Arc::new(
+        cognitive_memory_llm::FakeLlmProvider::new("fake", "fake-judge")
+            .with_responses(["CONTRADICTION"]),
+    ) as Arc<dyn cognitive_memory_llm::LlmProvider>;
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_llm(llm).await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    // Plant the existing memory as CORE, then store a near-duplicate
+    // that the LLM judge rules CONTRADICTION (so existing — the core —
+    // becomes the loser).
+    let mut v_anchor = vec![0.0f32; 16];
+    v_anchor[0] = 1.0;
+    let mut v_new = vec![0.0f32; 16];
+    v_new[0] = 0.9;
+    v_new[1] = (0.19f32).sqrt();
+    embeddings.set_override("user identity is alice", v_anchor);
+    embeddings.set_override("user identity is alice m", v_new);
+
+    let core_resp = client
+        .request(Request::Memory(MemoryRequest::Store(StoreMemoryArgs {
+            user_id: "alice".to_string(),
+            content: "user identity is alice".to_string(),
+            category: "core".to_string(),
+            memory_type: "fact".to_string(),
+            metadata: "{}".to_string(),
+            importance: None,
+        })))
+        .await
+        .unwrap();
+    let core_id = match core_resp.data.unwrap() {
+        ResponseData::MemoryStored(s) => s.id,
+        _ => panic!(),
+    };
+    let _new_id = store_helper(&mut client, "user identity is alice m", "semantic").await;
+
+    // Pre-condition: anchor is core, retention_floor 0.6.
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let (cat_pre, floor_pre): (String, f64) =
+        sqlx::query_as("SELECT category, retention_floor FROM memories WHERE id = ?")
+            .bind(&core_id)
+            .fetch_one(store.reader())
+            .await
+            .unwrap();
+    assert_eq!(cat_pre, "core");
+    assert!((floor_pre - 0.6).abs() < 1e-6);
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+
+    let (cat_post, floor_post): (String, f64) =
+        sqlx::query_as("SELECT category, retention_floor FROM memories WHERE id = ?")
+            .bind(&core_id)
+            .fetch_one(store.reader())
+            .await
+            .unwrap();
+    drop(store);
+    assert_eq!(cat_post, "semantic", "core loser must demote to semantic");
+    assert!(
+        floor_post.abs() < 1e-6,
+        "demoted core's retention_floor must reset to 0.0, got {floor_post}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+// ===========================================================================
+// Stage 4 — Consolidation (clustering + LLM compress)
+// ===========================================================================
+
+/// Plant N memories in `category` whose embeddings cluster (cosine
+/// ≥0.7 with `head_v`) and backdate them so retention is below the
+/// 0.20 consolidation threshold. Returns their IDs.
+async fn plant_fading_cluster(
+    client: &mut Client,
+    embeddings: &Arc<FakeEmbeddingProvider>,
+    store: &Store,
+    category: &str,
+    head_v: Vec<f32>,
+    n: usize,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let text = format!("cluster {category} item {i}");
+        // Each item: same head vector with tiny per-item perturbation
+        // so they're distinct memories but cosine ≥ 0.99 (same cluster).
+        let mut v = head_v.clone();
+        // Perturb the last component minimally; keep cosine high.
+        let dim = v.len();
+        v[dim - 1] += (i as f32) * 1e-4;
+        embeddings.set_override(text.clone(), v);
+        let id = store_helper(client, &text, category).await;
+        ids.push(id);
+    }
+    // Backdate so computed retention drops below 0.20.
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let backdated = now - 5 * 365 * 86_400; // 5 years ago — well into fading band
+    for id in &ids {
+        sqlx::query("UPDATE memories SET last_accessed_at = ?, created_at = ? WHERE id = ?")
+            .bind(backdated)
+            .bind(backdated)
+            .bind(id)
+            .execute(store.writer())
+            .await
+            .unwrap();
+    }
+    ids
+}
+
+/// Tick with no LLM configured: consolidation pass is a no-op. The
+/// daemon must NOT crash and must not create summary memories.
+#[tokio::test]
+async fn consolidation_with_no_llm_is_noop() {
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_embeddings().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let mut head_v = vec![0.0f32; 16];
+    head_v[0] = 1.0;
+    let _ids = plant_fading_cluster(&mut client, &embeddings, &store, "semantic", head_v, 6).await;
+    drop(store);
+
+    let counts_pre = match client
+        .request(Request::Diagnostics(DiagnosticsRequest::Counts(
+            CountsArgs {
+                user_id: "alice".to_string(),
+            },
+        )))
+        .await
+        .unwrap()
+        .data
+        .unwrap()
+    {
+        ResponseData::Counts(c) => c.total,
+        _ => panic!(),
+    };
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+
+    let counts_post = match client
+        .request(Request::Diagnostics(DiagnosticsRequest::Counts(
+            CountsArgs {
+                user_id: "alice".to_string(),
+            },
+        )))
+        .await
+        .unwrap()
+        .data
+        .unwrap()
+    {
+        ResponseData::Counts(c) => c.total,
+        _ => panic!(),
+    };
+
+    assert_eq!(
+        counts_pre, counts_post,
+        "no LLM ⇒ no summary memory created (counts unchanged)"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Tick with LLM + 6 fading semantic memories at high similarity:
+/// produces exactly 1 summary memory. The 6th item is left out (group
+/// caps at CONSOLIDATION_GROUP_SIZE=5).
+#[tokio::test]
+async fn consolidation_with_six_fading_creates_one_summary_of_five() {
+    let llm = Arc::new(
+        cognitive_memory_llm::FakeLlmProvider::new("fake", "fake-summary")
+            .with_responses(["User repeatedly mentioned hiking outdoors."]),
+    ) as Arc<dyn cognitive_memory_llm::LlmProvider>;
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_llm(llm).await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let mut head_v = vec![0.0f32; 16];
+    head_v[0] = 1.0;
+    let ids = plant_fading_cluster(&mut client, &embeddings, &store, "semantic", head_v, 6).await;
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+
+    // Count summary memories: any memory whose memory_type='summary'.
+    let (summaries,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM memories WHERE memory_type = 'summary'")
+            .fetch_one(store.reader())
+            .await
+            .unwrap();
+    assert_eq!(summaries, 1, "exactly one summary should be created");
+
+    // Exactly 5 of the 6 originals should be superseded + cold.
+    let (superseded_n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM memories WHERE is_superseded = 1 AND is_cold = 1
+         AND id IN (SELECT id FROM memories WHERE memory_type = 'fact')",
+    )
+    .fetch_one(store.reader())
+    .await
+    .unwrap();
+    drop(store);
+    assert_eq!(
+        superseded_n, 5,
+        "5 of the 6 originals should be superseded + cold; 6th left for next tick"
+    );
+    assert_eq!(ids.len(), 6); // sanity
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// 4 fading memories: below CONSOLIDATION_GROUP_SIZE=5 ⇒ no clusters
+/// formed, no summary created.
+#[tokio::test]
+async fn consolidation_below_group_size_creates_no_summary() {
+    let llm = Arc::new(
+        cognitive_memory_llm::FakeLlmProvider::new("fake", "fake-summary").with_responses(["x"]),
+    ) as Arc<dyn cognitive_memory_llm::LlmProvider>;
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_llm(llm).await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let mut head_v = vec![0.0f32; 16];
+    head_v[0] = 1.0;
+    let _ = plant_fading_cluster(&mut client, &embeddings, &store, "semantic", head_v, 4).await;
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+
+    let (summaries,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM memories WHERE memory_type = 'summary'")
+            .fetch_one(store.reader())
+            .await
+            .unwrap();
+    drop(store);
+    assert_eq!(summaries, 0, "below group size = no clustering");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Per-category isolation: 3 semantic + 2 episodic fading. Neither
+/// category meets CONSOLIDATION_GROUP_SIZE=5 alone ⇒ no summaries.
+#[tokio::test]
+async fn consolidation_does_not_cluster_across_categories() {
+    let llm = Arc::new(
+        cognitive_memory_llm::FakeLlmProvider::new("fake", "fake-summary").with_responses(["x"]),
+    ) as Arc<dyn cognitive_memory_llm::LlmProvider>;
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_llm(llm).await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let mut head_v = vec![0.0f32; 16];
+    head_v[0] = 1.0;
+    let _ = plant_fading_cluster(
+        &mut client,
+        &embeddings,
+        &store,
+        "semantic",
+        head_v.clone(),
+        3,
+    )
+    .await;
+    let _ = plant_fading_cluster(&mut client, &embeddings, &store, "episodic", head_v, 2).await;
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+
+    let (summaries,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM memories WHERE memory_type = 'summary'")
+            .fetch_one(store.reader())
+            .await
+            .unwrap();
+    drop(store);
+    assert_eq!(summaries, 0, "categories are clustered separately");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// 5-memory cluster with FakeLlm returning a known summary string:
+/// resulting summary memory has the LLM's content, max(importance),
+/// mean(stability), inherited category, and an embedding.
+#[tokio::test]
+async fn consolidation_summary_carries_max_importance_and_mean_stability() {
+    let summary = "User has consistently preferred blue.";
+    // Plant N=5 same-cluster memories. Each store fires a conflict
+    // search against all previous (cos≈1.0 ≥ 0.85 threshold), so
+    // the queue accumulates C(5,2)=10 conflict pairs by store time.
+    // Tick consumes the LLM responses in order: 10 conflict-judge
+    // calls THEN 1 consolidation call. Queue exactly 10 NONEs (so
+    // conflicts no-op) then the summary (consumed by consolidation).
+    let mut responses: Vec<String> = std::iter::repeat_n("NONE".to_string(), 10).collect();
+    responses.push(summary.to_string());
+    // Tail padding for any extra LLM calls we don't expect — defensive.
+    responses.extend(std::iter::repeat_n("NONE".to_string(), 10));
+    let llm = Arc::new(
+        cognitive_memory_llm::FakeLlmProvider::new("fake", "fake-summary")
+            .with_responses(responses),
+    ) as Arc<dyn cognitive_memory_llm::LlmProvider>;
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_llm(llm).await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let mut head_v = vec![0.0f32; 16];
+    head_v[0] = 1.0;
+    let ids = plant_fading_cluster(&mut client, &embeddings, &store, "semantic", head_v, 5).await;
+
+    // Pin importance + stability low enough that the importance
+    // multiplier `B = 1 + 2*importance` doesn't lift retention out
+    // of the fading band. importance = [0.04, 0.08, 0.12, 0.16, 0.20]
+    // → max = 0.20. stability = [0.05, 0.10, 0.15, 0.20, 0.25] → mean
+    // = 0.15. With β=120 and Δt=365d, R ≈ 0.16 (below 0.20 threshold).
+    for (i, id) in ids.iter().enumerate() {
+        let imp = 0.04 * ((i + 1) as f64);
+        let stab = 0.05 * ((i + 1) as f64);
+        sqlx::query("UPDATE memories SET importance = ?, stability = ? WHERE id = ?")
+            .bind(imp)
+            .bind(stab)
+            .bind(id)
+            .execute(store.writer())
+            .await
+            .unwrap();
+    }
+
+    client
+        .request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+            synchronous: true,
+        })))
+        .await
+        .unwrap();
+
+    let row: (String, String, f64, f64, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT content, category, importance, stability, embedding
+         FROM memories WHERE memory_type = 'summary'",
+    )
+    .fetch_one(store.reader())
+    .await
+    .unwrap();
+    drop(store);
+    let (content, category, importance, stability, embedding) = row;
+    assert_eq!(content, summary, "summary content from LLM");
+    assert_eq!(category, "semantic", "summary inherits group category");
+    // importance = max([0.04, 0.08, 0.12, 0.16, 0.20]) = 0.20.
+    assert!(
+        (importance - 0.20).abs() < 1e-6,
+        "importance = max(group), expected 0.20, got {importance}"
+    );
+    // stability = mean([0.05, 0.10, 0.15, 0.20, 0.25]) = 0.15.
+    assert!(
+        (stability - 0.15).abs() < 1e-6,
+        "stability = mean(group), expected 0.15, got {stability}"
+    );
+    assert!(embedding.is_some(), "summary must be embedded");
 
     let _ = shutdown.send(());
     let _ = handle.await;
