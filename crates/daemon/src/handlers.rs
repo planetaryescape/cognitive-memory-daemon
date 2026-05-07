@@ -6,8 +6,7 @@
 
 use cognitive_memory_embeddings::{CachedEmbeddings, EmbeddingError, EmbeddingProvider};
 use cognitive_memory_lifecycle::{
-    base_decay_rate_for_category, compute_retention, parse_category, stability_from_importance,
-    LifecycleConfig, MemoryState,
+    compute_retention, parse_category, stability_from_importance, LifecycleConfig, MemoryState,
 };
 use cognitive_memory_protocol::{
     AffectedData, BatchUpdateArgs, BridgeTokenData, ClearArgs, ConvertToStubArgs, CountsArgs,
@@ -67,6 +66,11 @@ pub struct AppState {
     ///   `provider = "anthropic"` ⇒ AnthropicProvider (existing)
     /// See `crates/cli/src/main.rs::download_model` and `set-llm`.
     pub llm: Option<Arc<dyn cognitive_memory_llm::LlmProvider>>,
+    /// Lifecycle parameters (decay model, β per category, boosts,
+    /// thresholds). Built at startup from `DaemonConfig.lifecycle`
+    /// overrides merged onto paper-faithful defaults. Used by
+    /// `compute_current_retention` and consolidation/promotion paths.
+    pub lifecycle: LifecycleConfig,
 }
 
 #[instrument(skip(req, state), fields(user_id = %user_id))]
@@ -316,7 +320,7 @@ async fn queue_conflicts_for(
         bridge_discovery: false,
         max_bridge_paths: 3,
     };
-    let hits = Searcher::new(&state.store)
+    let hits = Searcher::with_lifecycle(&state.store, state.lifecycle.clone())
         .search(user_id, new_vec, &opts)
         .await?;
 
@@ -491,7 +495,7 @@ async fn handle_memory_search(
         bridge_discovery: args.bridge_discovery,
         max_bridge_paths: 3,
     };
-    let searcher = Searcher::new(&state.store);
+    let searcher = Searcher::with_lifecycle(&state.store, state.lifecycle.clone());
     let results = searcher.search(&args.user_id, &query_vec, &opts).await?;
     let anchor_ids: Vec<String> = results.iter().map(|r| r.memory_id.clone()).collect();
     let bridge_paths = searcher.find_bridges(&anchor_ids, &opts).await?;
@@ -588,7 +592,7 @@ async fn apply_post_retrieval_strengthening(
         .map(|(id, src)| (id.as_str(), *src))
         .collect();
 
-    let cfg = lifecycle_config();
+    let cfg = &state.lifecycle;
     let mut boosts: Vec<(String, f64)> = Vec::with_capacity(rows.len());
     let mut promotions: Vec<String> = Vec::new();
 
@@ -659,7 +663,10 @@ async fn handle_memory_get(
         row.cold_since = None;
         row.days_at_floor = 0;
     }
-    Ok(Response::ok(ResponseData::Memory(memory_row_to_data(row))))
+    Ok(Response::ok(ResponseData::Memory(memory_row_to_data(
+        row,
+        &state.lifecycle,
+    ))))
 }
 
 async fn handle_memory_get_many(
@@ -685,7 +692,10 @@ async fn handle_memory_get_many(
         }
     }
     Ok(Response::ok(ResponseData::Memories(MemoriesData {
-        memories: rows.into_iter().map(memory_row_to_data).collect(),
+        memories: rows
+            .into_iter()
+            .map(|r| memory_row_to_data(r, &state.lifecycle))
+            .collect(),
     })))
 }
 
@@ -712,7 +722,10 @@ async fn handle_memory_list(
         .query(&args.user_id, &filters)
         .await?;
     Ok(Response::ok(ResponseData::Memories(MemoriesData {
-        memories: rows.into_iter().map(memory_row_to_data).collect(),
+        memories: rows
+            .into_iter()
+            .map(|r| memory_row_to_data(r, &state.lifecycle))
+            .collect(),
     })))
 }
 
@@ -837,7 +850,7 @@ async fn handle_memory_get_linked(
     let memories = linked
         .into_iter()
         .map(|lm| LinkedMemoryData {
-            memory: memory_row_to_data(lm.memory),
+            memory: memory_row_to_data(lm.memory, &state.lifecycle),
             link_strength: lm.link_strength,
         })
         .collect();
@@ -858,7 +871,7 @@ async fn handle_memory_get_linked_many(
     let memories = linked
         .into_iter()
         .map(|lm| LinkedMemoryData {
-            memory: memory_row_to_data(lm.memory),
+            memory: memory_row_to_data(lm.memory, &state.lifecycle),
             link_strength: lm.link_strength,
         })
         .collect();
@@ -887,7 +900,7 @@ async fn handle_vector_search(
         bridge_discovery: false,
         max_bridge_paths: 3,
     };
-    let results = Searcher::new(&state.store)
+    let results = Searcher::with_lifecycle(&state.store, state.lifecycle.clone())
         .search(&args.user_id, &args.embedding, &opts)
         .await?;
     let hits: Vec<SearchHit> = results
@@ -1012,7 +1025,7 @@ async fn handle_tick(_args: TickArgs, state: &Arc<AppState>) -> Result<Response,
     let mut tx = state.store.writer().begin().await?;
     let mut migrated_to_cold = 0u64;
     for row in hot_rows {
-        let retention = compute_current_retention(&row, now);
+        let retention = compute_current_retention(&row, now, &state.lifecycle);
         let at_floor = (retention - row.retention_floor).abs() < 1e-9 && row.retention_floor > 0.0;
         let new_days_at_floor = if at_floor {
             sqlx::query("UPDATE memories SET days_at_floor = days_at_floor + 1 WHERE id = ?")
@@ -1330,7 +1343,10 @@ async fn consolidate_at_tick(state: &Arc<AppState>, now: i64) -> Result<u64, Han
         // Filter to "fading" — computed retention below threshold.
         let fading: Vec<MemoryRow> = rows
             .into_iter()
-            .filter(|r| compute_current_retention(r, now) < CONSOLIDATION_RETENTION_THRESHOLD)
+            .filter(|r| {
+                compute_current_retention(r, now, &state.lifecycle)
+                    < CONSOLIDATION_RETENTION_THRESHOLD
+            })
             .collect();
 
         // Group by category. Greedy clustering happens within each.
@@ -1503,7 +1519,7 @@ async fn handle_find_fading(
     let mut scored: Vec<(MemoryRow, f64)> = rows
         .into_iter()
         .map(|row| {
-            let r = compute_current_retention(&row, now);
+            let r = compute_current_retention(&row, now, &state.lifecycle);
             (row, r)
         })
         .filter(|(_, r)| *r <= args.max_retention)
@@ -1514,7 +1530,7 @@ async fn handle_find_fading(
     Ok(Response::ok(ResponseData::Memories(MemoriesData {
         memories: scored
             .into_iter()
-            .map(|(row, _)| memory_row_to_data(row))
+            .map(|(row, _)| memory_row_to_data(row, &state.lifecycle))
             .collect(),
     })))
 }
@@ -1534,7 +1550,10 @@ async fn handle_find_stable(
         )
         .await?;
     Ok(Response::ok(ResponseData::Memories(MemoriesData {
-        memories: rows.into_iter().map(memory_row_to_data).collect(),
+        memories: rows
+            .into_iter()
+            .map(|r| memory_row_to_data(r, &state.lifecycle))
+            .collect(),
     })))
 }
 
@@ -1644,8 +1663,8 @@ fn require_user_match(arg_user: &str, connection_user: &str) -> Result<(), Handl
     Ok(())
 }
 
-fn memory_row_to_data(row: MemoryRow) -> MemoryData {
-    let current_retention = compute_current_retention(&row, unix_now());
+fn memory_row_to_data(row: MemoryRow, cfg: &LifecycleConfig) -> MemoryData {
+    let current_retention = compute_current_retention(&row, unix_now(), cfg);
     MemoryData {
         id: row.id,
         user_id: row.user_id,
@@ -1675,27 +1694,28 @@ fn memory_row_to_data(row: MemoryRow) -> MemoryData {
 /// Compute R(m) for a memory row at the given wall-clock time using the
 /// paper's power-law decay model (Equation 1). Reads the memory's
 /// stability, importance, retention floor, and category-derived
-/// `base_decay_rate`.
-fn compute_current_retention(row: &MemoryRow, now: i64) -> f64 {
+/// `base_decay_rate` (looked up from `cfg`).
+fn compute_current_retention(row: &MemoryRow, now: i64, cfg: &LifecycleConfig) -> f64 {
     let state = MemoryState {
         last_accessed_at: row.last_accessed_at,
         created_at: row.created_at,
         stability: row.stability,
         importance: row.importance,
-        base_decay_rate: base_decay_rate_for_category(&row.category),
+        base_decay_rate: cfg.beta_for(&row.category),
         floor: row.retention_floor,
         is_stub: row.is_stub,
         access_count: row.retrieval_count as u64,
         session_count: 0,
         category: parse_category(&row.category),
     };
-    compute_retention(&state, now, &lifecycle_config())
+    compute_retention(&state, now, cfg)
 }
 
-fn lifecycle_config() -> LifecycleConfig {
-    // Paper §3.2 defaults to power-law decay (gamma=0.7); the lifecycle
-    // crate's Default is exponential for backward-compat with the older
-    // SDK. The daemon ships the paper-faithful model.
+/// Paper-faithful daemon defaults: power-law decay (γ=0.7), Table 2 β.
+/// The lifecycle crate's `Default` is exponential (SDK back-compat); the
+/// daemon ships paper §3.2. Used by `Daemon::new*` when no override is
+/// supplied. Override via config.toml `[lifecycle]`.
+pub fn paper_faithful_lifecycle_config() -> LifecycleConfig {
     LifecycleConfig {
         decay_model: cognitive_memory_lifecycle::DecayModel::Power,
         ..LifecycleConfig::default()

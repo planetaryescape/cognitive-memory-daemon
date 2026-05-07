@@ -10,6 +10,7 @@
 //! `1e-4` absolute on f64 retention/score values.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Decay model selection. Mirrors the `decay_model` config field in the
 /// Python SDK.
@@ -47,6 +48,12 @@ pub struct LifecycleConfig {
     /// SDK default: 90 days. Mirrors
     /// `association_decay_constant_days` in types.py.
     pub association_decay_constant_days: f64,
+    /// Per-category base decay rate β_c (days). Default mirrors paper
+    /// §3.2 Table 2 / SDK `BASE_DECAY_RATES`. Made a config field in
+    /// Phase 0a-daemon so benchmarks/tuning can override per-trial via
+    /// `~/.config/cognitive-memory/config.toml [lifecycle]` without
+    /// rebuilds. Look up via `LifecycleConfig::beta_for(&category)`.
+    pub base_decay_rates: HashMap<String, f64>,
 }
 
 impl Default for LifecycleConfig {
@@ -66,7 +73,35 @@ impl Default for LifecycleConfig {
             core_stability_threshold: 0.85,
             core_session_threshold: 3,
             association_decay_constant_days: 90.0,
+            base_decay_rates: default_base_decay_rates(),
         }
+    }
+}
+
+/// Paper §3.2 Table 2 defaults. Wire-form keys ("episodic" etc.) so the
+/// map deserialises cleanly from TOML without a custom adapter.
+fn default_base_decay_rates() -> HashMap<String, f64> {
+    let mut m = HashMap::with_capacity(4);
+    m.insert("episodic".to_string(), 45.0);
+    m.insert("semantic".to_string(), 120.0);
+    m.insert("core".to_string(), 120.0);
+    m.insert("procedural".to_string(), f64::INFINITY);
+    m
+}
+
+impl LifecycleConfig {
+    /// Look up β_c (days) for a wire-form category string.
+    ///
+    /// Unknown categories fall back to the semantic default (120d) — same
+    /// contract the const-fn predecessor `base_decay_rate_for_category`
+    /// shipped, so callers passing a corrupt/post-schema-bump string
+    /// don't crash. Returns `f64::INFINITY` for `procedural` so
+    /// `compute_retention` short-circuits to 1.0 (no decay).
+    pub fn beta_for(&self, category: &str) -> f64 {
+        self.base_decay_rates
+            .get(category)
+            .copied()
+            .unwrap_or(120.0)
     }
 }
 

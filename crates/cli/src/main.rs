@@ -908,7 +908,12 @@ fn run_config_set_llm(
             ))
         }
     };
-    let cfg = cognitive_memory_core::DaemonConfig { llm: new_llm };
+    // Load → mutate → save so we don't clobber adjacent sections like
+    // [lifecycle] if the user hand-edited them. `load` returns Default
+    // on missing-file (Phase 0a-daemon).
+    let mut cfg = cognitive_memory_core::DaemonConfig::load()
+        .with_context(|| "load existing daemon config")?;
+    cfg.llm = new_llm;
     cfg.save().with_context(|| "save daemon config")?;
     println!(
         "saved config to {}",

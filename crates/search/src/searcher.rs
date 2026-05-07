@@ -7,20 +7,22 @@
 
 use crate::{cosine_similarity, SearchError};
 use cognitive_memory_lifecycle::{
-    base_decay_rate_for_category, compute_retention, decay_association_weight, parse_category,
-    DecayModel, LifecycleConfig, MemoryState,
+    compute_retention, decay_association_weight, parse_category, DecayModel, LifecycleConfig,
+    MemoryState,
 };
 use cognitive_memory_store::{AssociationRepo, MemoryRepo, SearchCandidate, Store};
 
 /// Build a `MemoryState` view from a `SearchCandidate` row, ready for
 /// `compute_retention`. Pulled out so the Searcher stays focused.
-fn candidate_to_state(c: &SearchCandidate) -> MemoryState {
+/// β_c is looked up via `cfg.beta_for(&category)` so daemon-level
+/// `[lifecycle]` overrides reach the search path (Phase 0a-daemon).
+fn candidate_to_state(c: &SearchCandidate, cfg: &LifecycleConfig) -> MemoryState {
     MemoryState {
         last_accessed_at: c.last_accessed_at,
         created_at: c.created_at,
         stability: c.stability,
         importance: c.importance,
-        base_decay_rate: base_decay_rate_for_category(&c.category),
+        base_decay_rate: cfg.beta_for(&c.category),
         floor: c.retention_floor,
         is_stub: c.is_stub,
         access_count: c.retrieval_count as u64,
@@ -29,9 +31,10 @@ fn candidate_to_state(c: &SearchCandidate) -> MemoryState {
     }
 }
 
-/// The lifecycle config the daemon's search uses. Power-law decay,
-/// α=0.3 — paper-faithful defaults.
-fn search_lifecycle_config() -> LifecycleConfig {
+/// The lifecycle config the daemon's search uses by default. Power-law
+/// decay, α=0.3 — paper-faithful. Used when a `Searcher` is constructed
+/// via `new` without an explicit config.
+fn default_search_lifecycle_config() -> LifecycleConfig {
     LifecycleConfig {
         decay_model: DecayModel::Power,
         ..LifecycleConfig::default()
@@ -123,11 +126,23 @@ impl SearchOptions {
 /// Vector searcher over a `Store`.
 pub struct Searcher<'a> {
     store: &'a Store,
+    life_cfg: LifecycleConfig,
 }
 
 impl<'a> Searcher<'a> {
     pub fn new(store: &'a Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            life_cfg: default_search_lifecycle_config(),
+        }
+    }
+
+    /// Construct with an explicit lifecycle config. The daemon uses this
+    /// to thread `AppState.lifecycle` (with config.toml overrides) into
+    /// the search path so `[lifecycle].base_decay_rates` reaches β_c
+    /// lookups in scoring + graph expansion.
+    pub fn with_lifecycle(store: &'a Store, life_cfg: LifecycleConfig) -> Self {
+        Self { store, life_cfg }
     }
 
     /// Search for the top-`limit` memories under `user_id` whose embeddings
@@ -158,7 +173,7 @@ impl<'a> Searcher<'a> {
             )
             .await?;
 
-        let life_cfg = search_lifecycle_config();
+        let life_cfg = &self.life_cfg;
         let alpha = life_cfg.retrieval_score_exponent;
 
         let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len());
@@ -171,8 +186,8 @@ impl<'a> Searcher<'a> {
                 });
             }
             let sim = cosine_similarity(query_vec, &memory_vec) as f64;
-            let state = candidate_to_state(&candidate);
-            let retention = compute_retention(&state, options.now, &life_cfg);
+            let state = candidate_to_state(&candidate, life_cfg);
+            let retention = compute_retention(&state, options.now, life_cfg);
             // Equation 3: score = relevance * R^α.
             let composite = sim * retention.powf(alpha);
             scored.push(SearchResult {
@@ -242,7 +257,7 @@ impl<'a> Searcher<'a> {
         // Graph expansion: walk associations from the top hits, scoring
         // newly-discovered memories by relevance * R^α * edge_weight.
         if options.graph_expansion_hops > 0 && !scored.is_empty() {
-            self.expand_via_graph(user_id, query_vec, &mut scored, &life_cfg, alpha, options)
+            self.expand_via_graph(user_id, query_vec, &mut scored, life_cfg, alpha, options)
                 .await?;
             // Re-sort after expansion adds new entries.
             scored.sort_by(|a, b| {
@@ -269,7 +284,6 @@ impl<'a> Searcher<'a> {
         alpha: f64,
         options: &SearchOptions,
     ) -> Result<(), SearchError> {
-        use cognitive_memory_lifecycle::base_decay_rate_for_category as base_rate;
         let assoc_repo = AssociationRepo::new(self.store);
 
         // Initial frontier: top hits to expand from. Limited to the
@@ -332,7 +346,7 @@ impl<'a> Searcher<'a> {
                     created_at: lm.memory.created_at,
                     stability: lm.memory.stability,
                     importance: lm.memory.importance,
-                    base_decay_rate: base_rate(&lm.memory.category),
+                    base_decay_rate: life_cfg.beta_for(&lm.memory.category),
                     floor: lm.memory.retention_floor,
                     is_stub: lm.memory.is_stub,
                     access_count: lm.memory.retrieval_count as u64,

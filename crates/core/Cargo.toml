@@ -16,3 +16,6 @@ ulid = { workspace = true }
 chrono = { workspace = true }
 toml = "0.8"
 dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

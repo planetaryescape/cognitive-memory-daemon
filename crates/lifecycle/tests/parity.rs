@@ -12,6 +12,91 @@ use cognitive_memory_lifecycle::{
     score_memory, session_root, stability_from_importance, Category, DecayModel, LifecycleConfig,
     MemoryState,
 };
+
+// =========================================================================
+// LifecycleConfig.base_decay_rates — Phase 0a-daemon. Per-category β values
+// move from a const fn (`base_decay_rate_for_category`) to a HashMap on
+// LifecycleConfig so the daemon can be re-tuned via config.toml without
+// rebuilds. Defaults match SDK / paper Table 2.
+//
+// Mirrors the SDK change in
+// `cognitive-memory-sdk/sdks/python/src/cognitive_memory/types.py:99`.
+// =========================================================================
+
+#[test]
+fn lifecycle_config_default_base_decay_rates_match_paper_table_2() {
+    // Paper §3.2 Table 2: episodic=45d, semantic=120d, core=120d,
+    // procedural=∞ (no decay). Tests assert through `beta_for(&str)` —
+    // the public lookup the daemon's compute_retention now uses.
+    let cfg = LifecycleConfig::default();
+    assert_eq!(cfg.beta_for("episodic"), 45.0);
+    assert_eq!(cfg.beta_for("semantic"), 120.0);
+    assert_eq!(cfg.beta_for("core"), 120.0);
+    assert!(
+        cfg.beta_for("procedural").is_infinite(),
+        "procedural β must be ∞ so compute_retention short-circuits to 1.0"
+    );
+}
+
+#[test]
+fn lifecycle_config_override_replaces_one_category_only() {
+    // Tuning trial: halve semantic β. Other categories stay at default
+    // (so we don't accidentally re-tune all four when only one was
+    // intended). Matches SDK's __post_init__ merge behaviour.
+    let mut cfg = LifecycleConfig::default();
+    cfg.base_decay_rates.insert("semantic".to_string(), 60.0);
+    assert_eq!(cfg.beta_for("semantic"), 60.0);
+    assert_eq!(cfg.beta_for("episodic"), 45.0);
+    assert_eq!(cfg.beta_for("core"), 120.0);
+    assert!(cfg.beta_for("procedural").is_infinite());
+}
+
+#[test]
+fn lifecycle_config_beta_for_unknown_category_falls_back_to_semantic_default() {
+    // Wire-form category strings come from sqlite rows; an unknown
+    // string (post-schema-bump or corrupt row) must not crash. The
+    // const-fn predecessor returned 120.0 — preserve that contract.
+    let cfg = LifecycleConfig::default();
+    assert_eq!(cfg.beta_for("unknown_xyz"), 120.0);
+}
+
+#[test]
+fn lifecycle_config_compute_retention_uses_config_beta_not_state_field() {
+    // End-to-end: when the caller forgets to set MemoryState.base_decay_rate
+    // and instead relies on the config lookup path, halving semantic β in
+    // the config doubles the effective decay rate for semantic memories
+    // (faster retention drop). Strict inequality is the contract.
+    let now: i64 = 1_700_000_000;
+    let last = now - (60 * 86_400); // 60 days ago
+    let make_state = |beta: f64| MemoryState {
+        last_accessed_at: last,
+        created_at: last,
+        stability: 0.5,
+        importance: 0.0,
+        base_decay_rate: beta,
+        floor: 0.0,
+        is_stub: false,
+        access_count: 0,
+        session_count: 0,
+        category: Category::Semantic,
+    };
+
+    let cfg_default = LifecycleConfig::default();
+    let cfg_fast = {
+        let mut c = LifecycleConfig::default();
+        c.base_decay_rates.insert("semantic".to_string(), 60.0);
+        c
+    };
+
+    let state_default = make_state(cfg_default.beta_for("semantic"));
+    let state_fast = make_state(cfg_fast.beta_for("semantic"));
+    let r_default = compute_retention(&state_default, now, &cfg_default);
+    let r_fast = compute_retention(&state_fast, now, &cfg_fast);
+    assert!(
+        r_fast < r_default,
+        "halving β must drop retention faster: r_default={r_default}, r_fast={r_fast}"
+    );
+}
 use pretty_assertions::assert_eq;
 
 const TOL: f64 = 1e-4;

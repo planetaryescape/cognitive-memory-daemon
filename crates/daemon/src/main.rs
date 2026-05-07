@@ -10,8 +10,11 @@
 // handling beyond Ctrl-C land in subsequent phases (per docs/decisions/
 // and ROADMAP.md).
 
-use cognitive_memory_daemon::{Daemon, DaemonConfig, LlmConfig};
+use cognitive_memory_daemon::{
+    paper_faithful_lifecycle_config, Daemon, DaemonConfig, LlmConfig,
+};
 use cognitive_memory_embeddings::EmbeddingProvider;
+use cognitive_memory_lifecycle::LifecycleConfig;
 use cognitive_memory_llm::LlmProvider;
 use cognitive_memory_store::Store;
 use std::path::PathBuf;
@@ -67,7 +70,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let daemon = Daemon::new_with_llm(store, embeddings, socket_path, llm);
+    let lifecycle = build_lifecycle_config();
+    if !is_paper_default(&lifecycle) {
+        tracing::info!(
+            base_decay_rates = ?lifecycle.base_decay_rates,
+            "lifecycle overrides applied from config.toml [lifecycle]"
+        );
+    }
+
+    let daemon = Daemon::new_full(store, embeddings, socket_path, llm, lifecycle);
     let shutdown = daemon.shutdown_handle();
 
     tokio::spawn(async move {
@@ -90,6 +101,36 @@ fn build_embeddings() -> Result<Arc<dyn EmbeddingProvider>, Box<dyn std::error::
 fn build_embeddings() -> Result<Arc<dyn EmbeddingProvider>, Box<dyn std::error::Error>> {
     use cognitive_memory_embeddings::FakeEmbeddingProvider;
     Ok(Arc::new(FakeEmbeddingProvider::new("local", "fake-16", 16)))
+}
+
+/// Build the daemon's `LifecycleConfig` from paper-faithful defaults
+/// merged with `[lifecycle]` overrides from config.toml. Missing or
+/// malformed config falls back to defaults so a config typo doesn't
+/// prevent the daemon from starting (logged warning at load time
+/// covers the diagnostic path).
+fn build_lifecycle_config() -> LifecycleConfig {
+    let mut cfg = paper_faithful_lifecycle_config();
+    let daemon_cfg = match DaemonConfig::load() {
+        Ok(c) => c,
+        Err(_) => return cfg,
+    };
+    let Some(overrides) = daemon_cfg.lifecycle else {
+        return cfg;
+    };
+    if let Some(rates) = overrides.base_decay_rates {
+        for (k, v) in rates {
+            // Replace one category's β; siblings retain paper default.
+            cfg.base_decay_rates.insert(k, v);
+        }
+    }
+    cfg
+}
+
+/// Cheap check used for the "overrides applied" log line. Avoids
+/// printing noise on every startup when the file has only `[llm]`.
+fn is_paper_default(cfg: &LifecycleConfig) -> bool {
+    let paper = paper_faithful_lifecycle_config();
+    cfg.base_decay_rates == paper.base_decay_rates
 }
 
 /// Read `~/.config/cognitive-memory/config.toml` and instantiate the

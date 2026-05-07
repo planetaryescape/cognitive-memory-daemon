@@ -9,4 +9,4 @@
 //! bottom of.
 
 mod config;
-pub use config::{config_path, ConfigError, DaemonConfig, LlmConfig};
+pub use config::{config_path, ConfigError, DaemonConfig, LifecycleOverrides, LlmConfig};

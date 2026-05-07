@@ -1,8 +1,9 @@
 //! IPC server: accept loop, per-connection task, dispatcher.
 
-use crate::handlers::{handle_request, AppState};
+use crate::handlers::{handle_request, paper_faithful_lifecycle_config, AppState};
 use bytes::BytesMut;
 use cognitive_memory_embeddings::EmbeddingProvider;
+use cognitive_memory_lifecycle::LifecycleConfig;
 use cognitive_memory_protocol::{
     IpcCodec, IpcMessage, IpcPayload, Response, ResponseError, ResponseErrorKind,
     IPC_PROTOCOL_VERSION,
@@ -59,6 +60,26 @@ impl Daemon {
         socket_path: PathBuf,
         llm: Option<Arc<dyn cognitive_memory_llm::LlmProvider>>,
     ) -> Self {
+        Self::new_full(
+            store,
+            embeddings,
+            socket_path,
+            llm,
+            paper_faithful_lifecycle_config(),
+        )
+    }
+
+    /// Full constructor with explicit lifecycle config — used by `main.rs`
+    /// after merging `DaemonConfig.lifecycle` overrides onto the
+    /// paper-faithful defaults. Existing callers (tests, simple wires)
+    /// stay on `new` / `new_with_llm` and get the paper defaults.
+    pub fn new_full(
+        store: Store,
+        embeddings: Arc<dyn EmbeddingProvider>,
+        socket_path: PathBuf,
+        llm: Option<Arc<dyn cognitive_memory_llm::LlmProvider>>,
+        lifecycle: LifecycleConfig,
+    ) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
         let state = Arc::new(AppState {
             store,
@@ -66,6 +87,7 @@ impl Daemon {
             request_semaphore: Arc::new(Semaphore::new(REQUEST_CONCURRENCY_LIMIT)),
             started_at: Instant::now(),
             llm,
+            lifecycle,
         });
         Self {
             state,
