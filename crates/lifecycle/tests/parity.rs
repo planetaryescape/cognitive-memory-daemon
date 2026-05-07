@@ -8,8 +8,8 @@
 #![allow(clippy::panic, clippy::unwrap_used)]
 
 use cognitive_memory_lifecycle::{
-    apply_direct_boost, check_core_promotion, compute_retention, score_memory, Category,
-    DecayModel, LifecycleConfig, MemoryState,
+    apply_direct_boost, check_core_promotion, compute_retention, score_memory, session_root,
+    stability_from_importance, Category, DecayModel, LifecycleConfig, MemoryState,
 };
 use pretty_assertions::assert_eq;
 
@@ -191,4 +191,70 @@ fn core_promotion_requires_all_three_thresholds() {
 
     // Already core: no further promotion.
     assert!(!check_core_promotion(&mut mem, &cfg));
+}
+
+// ===========================================================================
+// session_root — strips `_perspective_*` suffix so multi-perspective
+// retrievals of the same conversation count as one session toward core
+// promotion. Mirrors `_session_roots` in cognitive_memory/core.py:44-47.
+// ===========================================================================
+
+#[test]
+fn session_root_strips_perspective_suffix() {
+    // SDK: core.py:44-47 — `re.sub(r"_perspective_.*$", "", sid)`.
+    // The full sid `s_01ABC_perspective_user_view` reduces to its root
+    // `s_01ABC`. The substring after `_perspective_` is dropped.
+    assert_eq!(session_root("s_01ABC_perspective_user_view"), "s_01ABC");
+}
+
+#[test]
+fn session_root_passes_through_when_no_perspective_suffix() {
+    // SDK: core.py:44-47 — when no `_perspective_` substring exists,
+    // the regex sub is a no-op and the input is returned unchanged.
+    assert_eq!(session_root("s_01ABC"), "s_01ABC");
+}
+
+#[test]
+fn session_root_handles_empty_string() {
+    // SDK: core.py:44-47 — `re.sub(...)` on `""` returns `""`. Daemon
+    // must mirror so an empty session id (defensive caller) doesn't
+    // crash the dedup path.
+    assert_eq!(session_root(""), "");
+}
+
+#[test]
+fn session_root_strips_at_first_perspective_marker() {
+    // SDK regex `_perspective_.*$` is greedy on the suffix, anchored
+    // at end. Matches the FIRST occurrence and strips through end.
+    // `s_X_perspective_a_perspective_b` → `s_X` (everything from the
+    // first `_perspective_` onward is dropped).
+    assert_eq!(session_root("s_X_perspective_a_perspective_b"), "s_X");
+}
+
+// ===========================================================================
+// stability_from_importance — fresh memories start with stability per the
+// SDK formula `0.1 + 0.3 * importance`, NOT the placeholder 0.5 the
+// daemon currently hardcodes. Mirrors core.py:126 / extraction.py:216.
+// ===========================================================================
+
+#[test]
+fn stability_baseline_at_zero_importance() {
+    // SDK: core.py:126 — `stability=0.1 + (importance * 0.3)`.
+    // importance=0.0 → 0.1 + 0.0 = 0.1.
+    assert!(approx_eq(stability_from_importance(0.0), 0.1, TOL));
+}
+
+#[test]
+fn stability_baseline_at_mid_importance() {
+    // SDK: core.py:126 — importance=0.7 → 0.1 + 0.7*0.3 = 0.31.
+    // Non-trivial value catches a drop-the-bias mutation (`0.3*imp`)
+    // or a swap of constants (`0.3 + 0.1*imp`).
+    assert!(approx_eq(stability_from_importance(0.7), 0.31, TOL));
+}
+
+#[test]
+fn stability_baseline_at_max_importance() {
+    // SDK: core.py:126 — importance=1.0 → 0.1 + 1.0*0.3 = 0.4.
+    // Boundary at importance ceiling.
+    assert!(approx_eq(stability_from_importance(1.0), 0.4, TOL));
 }

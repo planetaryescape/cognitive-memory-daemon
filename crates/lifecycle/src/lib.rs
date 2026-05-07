@@ -114,6 +114,25 @@ pub fn parse_category(s: &str) -> Category {
     }
 }
 
+/// Initial stability for a freshly-created memory: `0.1 + 0.3 * importance`.
+/// Range: importance ∈ [0, 1] → stability ∈ [0.1, 0.4]. Mirrors the SDK
+/// constructor formula in `cognitive_memory/core.py:126` and
+/// `cognitive_memory/extraction.py:216`.
+pub fn stability_from_importance(importance: f64) -> f64 {
+    0.1 + 0.3 * importance
+}
+
+/// Strip the `_perspective_<...>` suffix from a session id so multiple
+/// per-perspective retrievals of the same conversation count as one
+/// session toward core promotion. Mirrors `_session_roots` in
+/// `cognitive_memory/core.py:44-47` (`re.sub(r"_perspective_.*$", "", sid)`).
+pub fn session_root(sid: &str) -> &str {
+    match sid.find("_perspective_") {
+        Some(idx) => &sid[..idx],
+        None => sid,
+    }
+}
+
 /// Base decay rate in days for a given category — Table 2 in the paper.
 /// Mirrors `BASE_DECAY_RATES` in `sdks/python/src/cognitive_memory/types.py`.
 /// `f64::INFINITY` means "never decays".

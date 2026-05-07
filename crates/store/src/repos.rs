@@ -107,7 +107,11 @@ impl MemoryRow {
             retrieval_count: 0,
             metadata: "{}".to_string(),
             importance: 0.0,
-            stability: 0.5,
+            // SDK: stability = 0.1 + 0.3 * importance (core.py:126).
+            // Default importance=0.0 ⇒ stability=0.1. Callers that
+            // override importance after construction must also call
+            // `stability_from_importance` to keep the invariant.
+            stability: 0.1,
             is_cold: false,
             cold_since: None,
             days_at_floor: 0,
@@ -406,6 +410,29 @@ impl<'a> MemoryRepo<'a> {
             q = q.bind(id);
         }
         Ok(q.execute(self.writer).await?.rows_affected())
+    }
+
+    /// Bump stability by `amount` (capped at 1.0) for one memory.
+    /// Used by the ingest-side stability-reinforcement path
+    /// (cognitive_memory/core.py:222-224) when a near-duplicate
+    /// (sim ∈ (0.75, 0.85)) is stored.
+    pub async fn reinforce_stability(
+        &self,
+        user_id: &str,
+        id: &str,
+        amount: f64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            "UPDATE memories
+             SET stability = MIN(1.0, stability + ?)
+             WHERE user_id = ? AND id = ?",
+        )
+        .bind(amount)
+        .bind(user_id)
+        .bind(id)
+        .execute(self.writer)
+        .await?;
+        Ok(r.rows_affected())
     }
 
     /// Apply direct-boost effects to a list of retrieved memories in

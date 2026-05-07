@@ -34,23 +34,37 @@ async fn boot_daemon() -> (
     tokio::sync::broadcast::Sender<()>,
     TempDir,
 ) {
+    let (handle, socket, shutdown, tmp, _) = boot_daemon_with_embeddings().await;
+    (handle, socket, shutdown, tmp)
+}
+
+/// Variant exposing the embeddings provider so tests can call
+/// `set_override` to pin specific cosine similarities between inputs.
+async fn boot_daemon_with_embeddings() -> (
+    tokio::task::JoinHandle<()>,
+    PathBuf,
+    tokio::sync::broadcast::Sender<()>,
+    TempDir,
+    Arc<FakeEmbeddingProvider>,
+) {
     let tmp = TempDir::new().unwrap();
     let socket_path = tmp.path().join("cm.sock");
     let db_path = tmp.path().join("data.db");
 
     let store = Store::open(&db_path).await.unwrap();
     let embeddings = Arc::new(FakeEmbeddingProvider::new("local", "fake-16", 16));
-    let daemon = Daemon::new(store, embeddings, socket_path.clone());
+    let embeddings_for_daemon: Arc<dyn cognitive_memory_embeddings::EmbeddingProvider> =
+        embeddings.clone();
+    let daemon = Daemon::new(store, embeddings_for_daemon, socket_path.clone());
     let shutdown = daemon.shutdown_handle();
 
     let handle = tokio::spawn(async move {
         daemon.serve().await.expect("daemon serve");
     });
 
-    // Wait briefly for the socket to appear.
     for _ in 0..100 {
         if socket_path.exists() {
-            return (handle, socket_path, shutdown, tmp);
+            return (handle, socket_path, shutdown, tmp, embeddings);
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -613,6 +627,315 @@ async fn store_writes_importance_when_supplied_and_clamps_out_of_range() {
     let _ = handle.await;
 }
 
+/// Stability at creation must follow the SDK formula `0.1 + 0.3 * importance`
+/// (cognitive_memory/core.py:126), not the legacy hardcoded 0.5. Three
+/// values across the importance range pin the linear relationship.
+#[tokio::test]
+async fn store_initial_stability_follows_importance_formula() {
+    let (handle, socket, shutdown, _tmp) = boot_daemon().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    async fn store_and_fetch_stability(
+        client: &mut Client,
+        importance: Option<f64>,
+        content: &str,
+    ) -> f64 {
+        let stored = client
+            .request(Request::Memory(MemoryRequest::Store(StoreMemoryArgs {
+                user_id: "alice".to_string(),
+                content: content.to_string(),
+                category: "semantic".to_string(),
+                memory_type: "fact".to_string(),
+                metadata: "{}".to_string(),
+                importance,
+            })))
+            .await
+            .unwrap();
+        let id = match stored.data.unwrap() {
+            ResponseData::MemoryStored(s) => s.id,
+            other => panic!("expected MemoryStored, got {other:?}"),
+        };
+        let got = client
+            .request(Request::Memory(MemoryRequest::Get(GetMemoryArgs {
+                user_id: "alice".to_string(),
+                id,
+            })))
+            .await
+            .unwrap();
+        match got.data.unwrap() {
+            ResponseData::Memory(m) => m.stability,
+            other => panic!("expected Memory, got {other:?}"),
+        }
+    }
+
+    // SDK: stability = 0.1 + 0.3 * importance.
+    // importance=None ⇒ daemon default (importance=0) ⇒ stability=0.1.
+    let s_default = store_and_fetch_stability(&mut client, None, "no imp").await;
+    assert!(
+        (s_default - 0.1).abs() < 1e-6,
+        "default stability should be 0.1, got {s_default}"
+    );
+
+    // importance=0.5 ⇒ stability = 0.1 + 0.15 = 0.25.
+    let s_mid = store_and_fetch_stability(&mut client, Some(0.5), "mid imp").await;
+    assert!(
+        (s_mid - 0.25).abs() < 1e-6,
+        "stability at importance=0.5 should be 0.25, got {s_mid}"
+    );
+
+    // importance=1.0 ⇒ stability = 0.4.
+    let s_max = store_and_fetch_stability(&mut client, Some(1.0), "max imp").await;
+    assert!(
+        (s_max - 0.4).abs() < 1e-6,
+        "stability at importance=1.0 should be 0.4, got {s_max}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Stability reinforcement on ingest (SDK core.py:222-224): when a
+/// new memory is similar to an existing one in the band
+/// (STABILITY_REINFORCEMENT_THRESHOLD=0.75, CONFLICT_SIMILARITY_THRESHOLD=0.85),
+/// the existing memory's stability is bumped by +0.05 (capped at 1.0).
+/// Above 0.85 → conflict path (no boost). Below 0.75 → no action.
+#[tokio::test]
+async fn ingest_stability_reinforcement_in_high_similarity_band() {
+    let (handle, socket, shutdown, _tmp, embeddings) = boot_daemon_with_embeddings().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    // Pin two embeddings with cosine ≈ 0.80, in the (0.75, 0.85) band.
+    // 16-dim vectors:
+    //   v1 = [1, 0, 0, ..., 0]
+    //   v2 = [0.8, 0.6, 0, ..., 0]
+    // |v1| = 1, |v2| = sqrt(0.64+0.36) = 1, dot = 0.8 → cosine = 0.80.
+    let mut v1 = vec![0.0f32; 16];
+    v1[0] = 1.0;
+    let mut v2 = vec![0.0f32; 16];
+    v2[0] = 0.8;
+    v2[1] = 0.6;
+    embeddings.set_override("anchor reinforce text", v1);
+    embeddings.set_override("near duplicate reinforce text", v2);
+
+    // Store anchor with importance=0 ⇒ stability=0.1 (SDK formula).
+    let anchor_resp = client
+        .request(Request::Memory(MemoryRequest::Store(StoreMemoryArgs {
+            user_id: "alice".to_string(),
+            content: "anchor reinforce text".to_string(),
+            category: "semantic".to_string(),
+            memory_type: "fact".to_string(),
+            metadata: "{}".to_string(),
+            importance: None,
+        })))
+        .await
+        .unwrap();
+    let anchor_id = match anchor_resp.data.unwrap() {
+        ResponseData::MemoryStored(s) => s.id,
+        _ => panic!("expected MemoryStored"),
+    };
+
+    // Pre-condition check: anchor stability is 0.1.
+    let pre = fetch(&mut client, &anchor_id).await;
+    assert!(
+        (pre.stability - 0.1).abs() < 1e-6,
+        "anchor pre-stability should be 0.1, got {}",
+        pre.stability
+    );
+
+    // Store the near-duplicate. Should trigger reinforcement on anchor.
+    let _ = client
+        .request(Request::Memory(MemoryRequest::Store(StoreMemoryArgs {
+            user_id: "alice".to_string(),
+            content: "near duplicate reinforce text".to_string(),
+            category: "semantic".to_string(),
+            memory_type: "fact".to_string(),
+            metadata: "{}".to_string(),
+            importance: None,
+        })))
+        .await
+        .unwrap();
+
+    // Anchor stability must be 0.1 + 0.05 = 0.15.
+    let post = fetch(&mut client, &anchor_id).await;
+    assert!(
+        (post.stability - 0.15).abs() < 1e-6,
+        "anchor post-stability should be 0.15 (reinforced), got {}",
+        post.stability
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Synaptic tagging on ingest (SDK core.py:248-262): when a new
+/// memory is similar to an existing one in the band [0.4, 0.75), an
+/// auto-link is created bidirectionally with weight
+/// `min(0.5, 0.2 + (sim - 0.4) * 0.5)`. Mirror INGESTION_ASSOCIATION_*.
+#[tokio::test]
+async fn ingest_synaptic_tag_in_mid_similarity_band() {
+    let (handle, socket, shutdown, _tmp, embeddings) = boot_daemon_with_embeddings().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    // cosine ≈ 0.50 — in synaptic-tag band [0.4, 0.75).
+    // 16-dim:
+    //   v1 = [1, 0, 0, ..., 0]      → norm 1
+    //   v2 = [0.5, sqrt(0.75), 0, ..., 0] → dot=0.5, norm=1, cos=0.50
+    let mut v1 = vec![0.0f32; 16];
+    v1[0] = 1.0;
+    let mut v2 = vec![0.0f32; 16];
+    v2[0] = 0.5;
+    v2[1] = (0.75f32).sqrt();
+    embeddings.set_override("anchor synaptic", v1);
+    embeddings.set_override("midband synaptic", v2);
+
+    let anchor_id = store_helper(&mut client, "anchor synaptic", "semantic").await;
+    let _new_id = store_helper(&mut client, "midband synaptic", "semantic").await;
+
+    // SDK weight: min(0.5, 0.2 + (0.5 - 0.4) * 0.5) = min(0.5, 0.25) = 0.25
+    let resp = client
+        .request(Request::Memory(MemoryRequest::GetLinked(GetLinkedArgs {
+            user_id: "alice".to_string(),
+            source_id: anchor_id.clone(),
+            min_strength: 0.0,
+        })))
+        .await
+        .unwrap();
+    let linked = match resp.data.unwrap() {
+        ResponseData::LinkedMemories(d) => d.memories,
+        _ => panic!("expected LinkedMemories"),
+    };
+    assert_eq!(
+        linked.len(),
+        1,
+        "anchor should have exactly 1 synaptic-tagged neighbor"
+    );
+    let weight = linked[0].link_strength;
+    assert!(
+        (weight - 0.25).abs() < 1e-6,
+        "synaptic weight at sim=0.50 should be 0.25 (= 0.2 + 0.05), got {weight}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Below the synaptic-tag threshold (0.4): no link, no stability boost,
+/// no conflict queue entry. The single-search dispatcher must return
+/// no-op when the highest-similarity hit is too low to act on.
+#[tokio::test]
+async fn ingest_below_threshold_is_a_noop() {
+    let (handle, socket, shutdown, _tmp, embeddings) = boot_daemon_with_embeddings().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    // cosine ≈ 0.20 — below all bands.
+    //   v1 = [1, 0, ...]
+    //   v2 = [0.2, sqrt(0.96), 0, ...]
+    let mut v1 = vec![0.0f32; 16];
+    v1[0] = 1.0;
+    let mut v2 = vec![0.0f32; 16];
+    v2[0] = 0.2;
+    v2[1] = (0.96f32).sqrt();
+    embeddings.set_override("anchor below threshold", v1);
+    embeddings.set_override("low sim other", v2);
+
+    let anchor_id = store_helper(&mut client, "anchor below threshold", "semantic").await;
+    let _ = store_helper(&mut client, "low sim other", "semantic").await;
+
+    // No edge created.
+    let resp = client
+        .request(Request::Memory(MemoryRequest::GetLinked(GetLinkedArgs {
+            user_id: "alice".to_string(),
+            source_id: anchor_id.clone(),
+            min_strength: 0.0,
+        })))
+        .await
+        .unwrap();
+    let linked = match resp.data.unwrap() {
+        ResponseData::LinkedMemories(d) => d.memories,
+        _ => panic!("expected LinkedMemories"),
+    };
+    assert!(linked.is_empty(), "no link should be created below sim=0.4");
+
+    // No stability boost on anchor (still 0.1).
+    let m = fetch(&mut client, &anchor_id).await;
+    assert!(
+        (m.stability - 0.1).abs() < 1e-6,
+        "anchor stability untouched, got {}",
+        m.stability
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Conflict band (sim ≥ 0.85) regression: queue the pair, do NOT
+/// reinforce stability and do NOT auto-link. Bands are exclusive.
+#[tokio::test]
+async fn ingest_at_conflict_threshold_only_queues() {
+    let (handle, socket, shutdown, tmp, embeddings) = boot_daemon_with_embeddings().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    // cosine ≈ 0.90 — conflict band.
+    //   v1 = [1, 0, ...]
+    //   v2 = [0.9, sqrt(0.19), 0, ...] → dot=0.9, norm=1, cos=0.90
+    let mut v1 = vec![0.0f32; 16];
+    v1[0] = 1.0;
+    let mut v2 = vec![0.0f32; 16];
+    v2[0] = 0.9;
+    v2[1] = (0.19f32).sqrt();
+    embeddings.set_override("anchor conflict", v1);
+    embeddings.set_override("near duplicate conflict", v2);
+
+    let anchor_id = store_helper(&mut client, "anchor conflict", "semantic").await;
+    let _ = store_helper(&mut client, "near duplicate conflict", "semantic").await;
+
+    // 1 row in conflict_queue.
+    let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM conflict_queue WHERE user_id = ?")
+        .bind("alice")
+        .fetch_one(store.reader())
+        .await
+        .unwrap();
+    drop(store);
+    assert_eq!(n, 1, "conflict queue should have exactly 1 entry");
+
+    // Anchor stability unchanged (0.1) — bands are exclusive.
+    let m = fetch(&mut client, &anchor_id).await;
+    assert!(
+        (m.stability - 0.1).abs() < 1e-6,
+        "anchor stability should be untouched at conflict band, got {}",
+        m.stability
+    );
+
+    // No auto-link.
+    let resp = client
+        .request(Request::Memory(MemoryRequest::GetLinked(GetLinkedArgs {
+            user_id: "alice".to_string(),
+            source_id: anchor_id.clone(),
+            min_strength: 0.0,
+        })))
+        .await
+        .unwrap();
+    let linked = match resp.data.unwrap() {
+        ResponseData::LinkedMemories(d) => d.memories,
+        _ => panic!("expected LinkedMemories"),
+    };
+    assert!(linked.is_empty(), "no synaptic link in conflict band");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// Status uptime must reflect actual elapsed time, not the bug at
 /// 0.0.1 release where the field was hardcoded to 0.
 #[tokio::test]
@@ -727,11 +1050,19 @@ async fn current_retention_decays_over_time_per_category() {
         fresh_episodic.current_retention
     );
 
-    // Backdate everything 365 days. Reach into the daemon's SQLite to
-    // edit last_accessed_at directly — there is no IPC op to set it.
+    // Backdate everything 365 days AND pin stability to 0.5 so the
+    // expected retention ranges below are derived purely from category
+    // (β) and Δt, not from the stability default. The default is
+    // 0.1 + 0.3*importance per the SDK; this test isolates decay-by-
+    // category, so we control stability explicitly.
     let store = Store::open(&tmp.path().join("data.db")).await.unwrap();
     for id in [&episodic_id, &semantic_id, &core_id, &proc_id] {
         backdate(&store, id, 365).await;
+        sqlx::query("UPDATE memories SET stability = 0.5 WHERE id = ?")
+            .bind(id)
+            .execute(store.writer())
+            .await
+            .unwrap();
     }
     drop(store);
 

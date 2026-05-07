@@ -6,7 +6,8 @@
 
 use cognitive_memory_embeddings::{CachedEmbeddings, EmbeddingError, EmbeddingProvider};
 use cognitive_memory_lifecycle::{
-    base_decay_rate_for_category, compute_retention, parse_category, LifecycleConfig, MemoryState,
+    base_decay_rate_for_category, compute_retention, parse_category, stability_from_importance,
+    LifecycleConfig, MemoryState,
 };
 use cognitive_memory_protocol::{
     AffectedData, BatchUpdateArgs, BridgeTokenData, ClearArgs, ConvertToStubArgs, CountsArgs,
@@ -221,6 +222,10 @@ async fn handle_memory_store(
     row.metadata = args.metadata;
     if let Some(imp) = args.importance {
         row.importance = imp.clamp(0.0, 1.0);
+        // Recompute stability from the new importance so the SDK
+        // invariant `stability = 0.1 + 0.3 * importance` holds at
+        // creation regardless of construction order.
+        row.stability = stability_from_importance(row.importance);
     }
     // Synaptic tagging (paper §3.4): category=core triggers protected
     // retention floor at encoding time.
@@ -246,10 +251,38 @@ async fn handle_memory_store(
 /// conflict candidates (core.py:38: CONFLICT_SIMILARITY_THRESHOLD).
 const CONFLICT_SIMILARITY_THRESHOLD: f64 = 0.85;
 
-/// Detect probable conflicts for a freshly stored memory by running a
-/// vector search against existing memories. Pairs with similarity ≥
-/// CONFLICT_SIMILARITY_THRESHOLD are inserted into `conflict_queue`
-/// for the next tick to resolve.
+/// Cosine threshold above which a newly-ingested near-duplicate
+/// reinforces the existing memory's stability by +0.05.
+/// Mirrors STABILITY_REINFORCEMENT_THRESHOLD in core.py:39.
+const STABILITY_REINFORCEMENT_THRESHOLD: f64 = 0.75;
+
+/// Stability bump applied during the reinforcement-band branch.
+/// SDK core.py:223 — `stability + 0.05`.
+const STABILITY_REINFORCEMENT_AMOUNT: f64 = 0.05;
+
+/// Cosine threshold above which a co-ingested memory is auto-linked
+/// to existing memories. Mirrors INGESTION_ASSOCIATION_THRESHOLD
+/// in cognitive_memory/core.py:40 (= 0.4).
+const SYNAPTIC_TAG_THRESHOLD: f64 = 0.4;
+
+/// Base weight for synaptic-tag links. Mirrors
+/// INGESTION_ASSOCIATION_BASE_WEIGHT in core.py:41 (= 0.2).
+const SYNAPTIC_TAG_BASE_WEIGHT: f64 = 0.2;
+
+/// Compute synaptic-tag weight from cosine similarity per SDK
+/// core.py:255 — `min(0.5, 0.2 + (sim - 0.4) * 0.5)`.
+fn synaptic_tag_weight(sim: f64) -> f64 {
+    (SYNAPTIC_TAG_BASE_WEIGHT + (sim - SYNAPTIC_TAG_THRESHOLD) * 0.5).min(0.5)
+}
+
+/// Detect similar memories for a freshly-stored memory by running a
+/// vector search and dispatching by similarity band:
+///   - sim ≥ 0.85 ⇒ insert into `conflict_queue` for tick to resolve
+///   - 0.75 ≤ sim < 0.85 ⇒ reinforce existing memory's stability +0.05
+///   - 0.40 ≤ sim < 0.75 ⇒ synaptic-tag (bidirectional auto-link)
+///   - sim < 0.40 ⇒ no action
+///
+/// Mirrors the dispatch logic in cognitive_memory/core.py:215-262.
 async fn queue_conflicts_for(
     state: &Arc<AppState>,
     user_id: &str,
@@ -279,25 +312,66 @@ async fn queue_conflicts_for(
         if hit.memory_id == new_id {
             continue;
         }
-        // The composite score on the searcher is `cosine * R^α`; we
-        // need raw cosine. R is bounded above by 1.0, so when scores
-        // are above the threshold the cosine is too. (Stricter
-        // boundary is fine — fewer false-positive conflict pairs.)
-        if (hit.score as f64) < CONFLICT_SIMILARITY_THRESHOLD {
-            break; // results are sorted desc; below threshold = done
+        // Composite score = cosine * R^α. Fresh memories have R≈1.0
+        // so score≈cosine; the order is preserved either way. Bands
+        // are exclusive; results sorted desc, so once we drop below
+        // the lowest band we can stop.
+        let sim = hit.score as f64;
+        if sim >= CONFLICT_SIMILARITY_THRESHOLD {
+            sqlx::query(
+                "INSERT OR IGNORE INTO conflict_queue
+                 (user_id, new_memory_id, existing_memory_id, similarity, queued_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(user_id)
+            .bind(new_id)
+            .bind(&hit.memory_id)
+            .bind(sim)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        } else if sim >= STABILITY_REINFORCEMENT_THRESHOLD {
+            // Inline the reinforcement write into the same tx so we
+            // don't deadlock against the single-connection writer
+            // pool. (`MemoryRepo::reinforce_stability` is the standalone
+            // version for callers that don't already hold a tx.)
+            sqlx::query(
+                "UPDATE memories
+                 SET stability = MIN(1.0, stability + ?)
+                 WHERE user_id = ? AND id = ?",
+            )
+            .bind(STABILITY_REINFORCEMENT_AMOUNT)
+            .bind(user_id)
+            .bind(&hit.memory_id)
+            .execute(&mut *tx)
+            .await?;
+        } else if sim >= SYNAPTIC_TAG_THRESHOLD {
+            // Synaptic tag — bidirectional auto-link with weight
+            // derived from similarity (paper §3.4 / SDK core.py:255).
+            let weight = synaptic_tag_weight(sim);
+            for (src, tgt) in [
+                (new_id, hit.memory_id.as_str()),
+                (hit.memory_id.as_str(), new_id),
+            ] {
+                sqlx::query(
+                    "INSERT INTO associations
+                       (source_memory_id, target_memory_id, weight, kind, updated_at)
+                     VALUES (?, ?, ?, 'synaptic', ?)
+                     ON CONFLICT(source_memory_id, target_memory_id) DO UPDATE
+                     SET weight = excluded.weight,
+                         kind = excluded.kind,
+                         updated_at = excluded.updated_at",
+                )
+                .bind(src)
+                .bind(tgt)
+                .bind(weight)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+        } else {
+            break;
         }
-        sqlx::query(
-            "INSERT OR IGNORE INTO conflict_queue
-             (user_id, new_memory_id, existing_memory_id, similarity, queued_at)
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(user_id)
-        .bind(new_id)
-        .bind(&hit.memory_id)
-        .bind(hit.score as f64)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
     }
     tx.commit().await?;
     Ok(())
