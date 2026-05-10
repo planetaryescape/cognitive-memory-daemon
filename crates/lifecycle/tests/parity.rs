@@ -24,13 +24,16 @@ use cognitive_memory_lifecycle::{
 // =========================================================================
 
 #[test]
-fn lifecycle_config_default_base_decay_rates_match_paper_table_2() {
-    // Paper §3.2 Table 2: episodic=45d, semantic=120d, core=120d,
-    // procedural=∞ (no decay). Tests assert through `beta_for(&str)` —
-    // the public lookup the daemon's compute_retention now uses.
+fn lifecycle_config_default_base_decay_rates_match_v0_5_tuned_values() {
+    // v0.5 tuned defaults from cognitive-memory-benchmarks Phase 1+5:
+    //   episodic=45d (paper Table 2), semantic=240d (raised from
+    //   paper's 120d), core=120d (paper), procedural=∞ (paper).
+    // Phase 1 OFAT swept semantic β across [30,60,120,180,240]; 240
+    // hit the maximum. Phase 5 LoCoMo (n=1540) confirmed the new
+    // defaults lift F1 +1.87pp / LLM acc +2.73pp vs paper-faithful.
     let cfg = LifecycleConfig::default();
     assert_eq!(cfg.beta_for("episodic"), 45.0);
-    assert_eq!(cfg.beta_for("semantic"), 120.0);
+    assert_eq!(cfg.beta_for("semantic"), 240.0);
     assert_eq!(cfg.beta_for("core"), 120.0);
     assert!(
         cfg.beta_for("procedural").is_infinite(),

@@ -60,30 +60,45 @@ impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {
             decay_model: DecayModel::Exponential,
-            // α=0.3 matches the Python SDK default (types.py:96). Lower
+            // α=0.3 matches the Python SDK default (types.py). Lower
             // alpha means decay weighs *less* in scoring — old but
             // exact-match memories still rank well.
             retrieval_score_exponent: 0.3,
             power_decay_gamma: 0.7,
             direct_boost: 0.1,
-            associative_boost: 0.03,
+            // v0.5 (2026-05-08): raised from paper's 0.03 to 0.05.
+            // cognitive-memory-benchmarks Phase 1 (sensitivity at n=15)
+            // found 0.03 was the WORST value tested across [0.01, 0.10].
+            // Phase 5 LoCoMo full benchmark (1540 Q) confirmed +1.87pp
+            // F1 + 2.73pp LLM accuracy at the v0.5 defaults vs paper.
+            associative_boost: 0.05,
             spaced_rep_interval_days: 7.0,
             max_spaced_rep_multiplier: 2.0,
             core_access_threshold: 10,
             core_stability_threshold: 0.85,
-            core_session_threshold: 3,
+            // v0.5 (2026-05-08): lowered from 3 to 2. Phase 2 Optuna
+            // joint search showed cst=2 lands in the high-fitness
+            // cluster 91% of trials vs cst=3's 67% (n=23 vs n=12).
+            core_session_threshold: 2,
             association_decay_constant_days: 90.0,
             base_decay_rates: default_base_decay_rates(),
         }
     }
 }
 
-/// Paper §3.2 Table 2 defaults. Wire-form keys ("episodic" etc.) so the
-/// map deserialises cleanly from TOML without a custom adapter.
+/// Per-category β_c (days). Defaults reflect the v0.5 empirical tuning
+/// (cognitive-memory-benchmarks Phase 1+5):
+///   - episodic, core, procedural: paper §3.2 Table 2 (45, 120, ∞)
+///   - semantic: 240 (was paper's 120). Phase 1 OFAT swept [30, 60,
+///     120, 180, 240]; 240 was the maximum (+1.4pp F1). Phase 2
+///     confirmed any value in [200, 370] is statistically equivalent.
+///
+/// Wire-form keys ("episodic" etc.) so the map deserialises cleanly
+/// from TOML without a custom adapter.
 fn default_base_decay_rates() -> HashMap<String, f64> {
     let mut m = HashMap::with_capacity(4);
     m.insert("episodic".to_string(), 45.0);
-    m.insert("semantic".to_string(), 120.0);
+    m.insert("semantic".to_string(), 240.0);  // v0.5: tuned from paper's 120
     m.insert("core".to_string(), 120.0);
     m.insert("procedural".to_string(), f64::INFINITY);
     m

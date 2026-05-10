@@ -1388,9 +1388,11 @@ async fn search_applies_smaller_boost_to_graph_expanded_results() {
         "direct stability should be 0.1 + 0.10*2 = 0.3, got {}",
         direct_post.stability
     );
+    // v0.5 default associative_boost = 0.05 (was paper's 0.03).
+    // 0.5 + 0.05*2 = 0.6.
     assert!(
-        (target_post.stability - 0.56).abs() < 1e-6,
-        "graph-expanded stability should be 0.5 + 0.03*2 = 0.56, got {}",
+        (target_post.stability - 0.6).abs() < 1e-6,
+        "graph-expanded stability should be 0.5 + 0.05*2 = 0.6 at v0.5 default, got {}",
         target_post.stability
     );
 
@@ -2437,11 +2439,12 @@ async fn current_retention_decays_over_time_per_category() {
         aged_episodic.current_retention
     );
 
-    // Semantic (β=120d): effective = 60. raw = (1 + 365/60)^-0.7
-    // = ~7.08^-0.7 ≈ 0.265.
+    // Semantic (β=240d, v0.5 tuned default — was 120d in paper Table 2):
+    // effective = 0.5 * 1 * 240 = 120. raw = (1 + 365/120)^-0.7
+    // = ~4.04^-0.7 ≈ 0.376. (Pre-v0.5 expected ≈ 0.265 with β=120.)
     assert!(
-        aged_semantic.current_retention > 0.20 && aged_semantic.current_retention < 0.35,
-        "semantic at 365d should be in (0.20, 0.35), got {}",
+        aged_semantic.current_retention > 0.30 && aged_semantic.current_retention < 0.45,
+        "semantic at 365d should be in (0.30, 0.45) at v0.5 β=240, got {}",
         aged_semantic.current_retention
     );
 
@@ -2772,15 +2775,16 @@ async fn lifecycle_override_changes_current_retention_through_ipc() {
 }
 
 #[tokio::test]
-async fn paper_faithful_default_matches_table_2_through_ipc() {
-    // Sibling test: confirm the daemon's `paper_faithful_lifecycle_config()`
-    // produces a retention that matches the hand-computed paper formula
-    // for a known memory shape. Catches accidental drift from Table 2
-    // defaults during refactors.
+async fn v0_5_default_matches_tuned_constants_through_ipc() {
+    // Pin the v0.5 tuned defaults (paper Table 2 + empirical
+    // adjustments from cognitive-memory-benchmarks Phase 1+5).
+    // Catches accidental reverts to paper-faithful values during
+    // refactors. Episodic/core/procedural unchanged from Table 2;
+    // semantic raised from 120 → 240.
     let cfg = cognitive_memory_daemon::paper_faithful_lifecycle_config();
     assert!(
-        (cfg.beta_for("semantic") - 120.0).abs() < 1e-9,
-        "paper default β_semantic must be 120d, got {}",
+        (cfg.beta_for("semantic") - 240.0).abs() < 1e-9,
+        "v0.5 tuned β_semantic must be 240d (was paper's 120d), got {}",
         cfg.beta_for("semantic")
     );
     assert!(
