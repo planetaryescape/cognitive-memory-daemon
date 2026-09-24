@@ -7,7 +7,7 @@ Version: `IPC_PROTOCOL_VERSION = 1`. This document and the daemon binary advance
 ## 1. Transport
 
 - **Type**: Unix domain socket, `SOCK_STREAM`.
-- **Path resolution** (in order): `COGNITIVE_MEMORY_SOCKET_PATH` env var, `~/Library/Application Support/cognitive-memory/cm.sock` (macOS), `$XDG_RUNTIME_DIR/cognitive-memory/cm.sock` (Linux).
+- **Path resolution** (in order): `COGNITIVE_MEMORY_SOCKET_PATH` env var, then the active runtime identity (`COGNITIVE_MEMORY_INSTANCE`; release default `cognitive-memory`, debug default `cognitive-memory-dev`) under the platform runtime directory.
 - **Permissions**: socket is mode 0700; parent directory is mode 0700. Owner-only.
 - **Encoding**: UTF-8 JSON.
 - **Framing**: 4-byte big-endian length prefix followed by JSON. Maximum frame: 16,777,216 bytes (16 MiB).
@@ -48,7 +48,7 @@ After `connect()`:
 ```
 
 - **`id`** is a `u64`. Clients allocate `id` monotonically per connection, starting at 1. Events sent from daemon to client use `id = 0`.
-- **`payload`** is one of `Request`, `Response`, `Event`. The variant is encoded as `{ "kind": "Request", "request": { ... } }` to keep the JSON discriminator-tagged and forward-compatible.
+- **`payload`** is one of `Request`, `Response`, `Event`. The variant is encoded as `{ "kind": "Request", "body": { ... } }` to keep the JSON discriminator-tagged and forward-compatible.
 
 The `Response` to a `Request` echoes the request's `id`. Multiple in-flight requests on one connection are allowed; responses may arrive out of order and are correlated by `id`.
 
@@ -56,10 +56,11 @@ The `Response` to a `Request` echoes the request's `id`. Multiple in-flight requ
 
 Every `Request` sits in exactly one bucket:
 
-- **`Memory`** — CRUD on memories, search, ingest, extraction, subscriptions to memory events.
-- **`Lifecycle`** — decay, consolidation, expiry, promotion, scheduled tick.
-- **`Diagnostics`** — health, status, traces, version, log access, bridge tokens.
-- **`ClientSpecific`** — UI state, never crosses the wire (mentioned for completeness).
+- **`Memory`** — store, batch store, CRUD/listing, search, links, lexical/vector search, batch updates, and subscriptions to memory events.
+- **`Lifecycle`** — explicit maintenance operations: tick, consolidation candidates, tier migration, retention updates, and clear.
+- **`Diagnostics`** — health, status, traces, shutdown, bridge tokens.
+
+Client-specific UI state intentionally does not cross the wire.
 
 Adding a request type: see `docs/developer/adding-a-request.md`.
 
@@ -71,31 +72,25 @@ Each entry below shows the request payload, response payload on success, and pos
 
 #### `Memory::Store`
 
-Store one or more memories.
+Store one memory.
 
 Request:
 ```json
 {
   "bucket": "Memory",
   "op": "Store",
-  "memories": [
-    {
-      "content": "User dislikes brittle integration tests with mocked databases.",
-      "category": "semantic",
-      "memory_type": "preference",
-      "metadata": { "project": "lazydap", "source_agent": "claude-code" },
-      "valid_from": "2026-05-07T10:00:00Z",
-      "ttl_seconds": null
-    }
-  ],
-  "embedding_override": null,
-  "llm_override": null
+  "user_id": "default",
+  "content": "User dislikes brittle integration tests with mocked databases.",
+  "category": "semantic",
+  "memory_type": "preference",
+  "metadata": "{\"project\":\"lazydap\"}",
+  "importance": 0.7
 }
 ```
 
 Response:
 ```json
-{ "ok": true, "data": { "stored": [{ "id": "mem_01H..." }] } }
+{ "ok": true, "data": { "kind": "MemoryStored", "id": "mem_01H..." } }
 ```
 
 Errors: `InvalidPayload`, `ProviderError`, `StorageError`.
@@ -107,18 +102,12 @@ Errors: `InvalidPayload`, `ProviderError`, `StorageError`.
   "bucket": "Memory",
   "op": "Search",
   "query": "How does the user feel about mocks?",
-  "filters": {
-    "memory_types": ["preference", "fact"],
-    "categories": null,
-    "metadata": { "project": "lazydap" }
-  },
+  "user_id": "default",
   "limit": 10,
   "deep_recall": false,
-  "include_expired_transients": false,
   "hybrid": true,
-  "graph_expansion": { "enabled": false, "hops": 1 },
-  "rerank": false,
-  "embedding_override": null
+  "graph_expansion_hops": 1,
+  "bridge_discovery": false
 }
 ```
 
@@ -127,55 +116,50 @@ Response:
 {
   "ok": true,
   "data": {
-    "results": [ { "memory": {...}, "score": 0.71, "retention": 0.93, "trace_id": "..." } ],
-    "trace": { "stages": { "dense_ms": 4.2, "sparse_ms": 1.3, "score_ms": 0.4, "rerank_ms": null } }
+    "kind": "MemorySearchResults",
+    "results": [ { "memory_id": "mem_01H...", "content": "...", "category": "semantic", "memory_type": "fact", "score": 0.71 } ],
+    "bridge_paths": []
   }
 }
 ```
 
 Errors: `InvalidQuery`, `ProviderError`, `StorageError`.
 
-#### `Memory::Get`, `Memory::Update`, `Memory::Delete`, `Memory::List`
+#### `Memory::Get`, `Memory::GetMany`, `Memory::Update`, `Memory::Delete`, `Memory::DeleteMany`, `Memory::List`
 
-Standard CRUD. Full schemas in `crates/protocol/src/memory.rs` once Phase 0 lands.
+Standard CRUD and listing. Full schemas live in `crates/protocol/src/lib.rs` and are covered by golden fixtures under `crates/protocol/tests/fixtures/`.
+
+#### `Memory::StoreBatch`
+
+Store many pre-extracted memories in one call. Memories created together get bidirectional associations by default.
+
+```json
+{ "bucket": "Memory", "op": "StoreBatch", "user_id": "default", "memories": [ { "content": "User prefers SQLite for local tools.", "category": "semantic", "memory_type": "preference", "metadata": "{}" } ], "initial_link_weight": 0.5 }
+```
 
 #### `Memory::Link`
 
 Create or update an association between two memories.
 
 ```json
-{ "bucket": "Memory", "op": "Link", "source_id": "mem_a", "target_id": "mem_b", "weight": 0.5, "kind": "explicit" }
+{ "bucket": "Memory", "op": "Link", "user_id": "default", "source_id": "mem_a", "target_id": "mem_b", "strength": 0.5, "bidirectional": true, "kind": "explicit" }
 ```
 
-#### `Memory::Ingest`
+Related link operations are `Unlink`, `GetLinked`, and `GetLinkedMany`.
 
-Ingest a turn or message and let the daemon decide whether to store, update, or merge.
+#### `Memory::VectorSearch`, `Memory::SearchLexical`, `Memory::BatchUpdate`
 
-```json
-{ "bucket": "Memory", "op": "Ingest", "turn": { "role": "user", "content": "..." }, "context": [...], "llm_override": null }
-```
-
-#### `Memory::ExtractAndStore`
-
-Run LLM extraction over a transcript and store extracted memories.
-
-```json
-{ "bucket": "Memory", "op": "ExtractAndStore", "transcript": [...], "llm_override": null, "embedding_override": null }
-```
+Specialized adapter-parity operations: raw-vector search for clients that already embedded the query, BM25-only lexical search, and batch retention-floor updates.
 
 #### `Memory::Subscribe`
 
 Subscribe to memory events on this connection.
 
 ```json
-{ "bucket": "Memory", "op": "Subscribe", "kinds": ["Stored", "Updated", "Deleted", "Expired"] }
+{ "bucket": "Memory", "op": "Subscribe", "replay_snapshot": true }
 ```
 
-Response is `{ "ok": true, "data": { "subscribed": [...] } }`. From this point, the daemon may push `Event` messages on the connection (see §6).
-
-#### `Memory::Unsubscribe`
-
-Symmetric.
+Response is `{ "ok": true, "data": { "kind": "Subscribed", "replay_snapshot_sent": true } }`. From this point, the daemon may push `Event` messages on the connection (see §6).
 
 ### 5.2 Lifecycle bucket
 
@@ -187,21 +171,7 @@ Symmetric.
 
 Async by default; returns immediately. With `synchronous: true`, response carries a summary of work performed.
 
-#### `Lifecycle::Consolidate`
-
-Trigger consolidation candidate scan, optionally limited.
-
-#### `Lifecycle::Expire`
-
-Hard-filter or remove expired transients. By default, expiry is logical (hidden from default retrieval); `Expire { mode: "purge" }` removes from storage.
-
-#### `Lifecycle::PromoteToCore`
-
-Manually promote a memory.
-
-#### `Lifecycle::DecayStats`
-
-Read-only retention distribution snapshot.
+Other lifecycle requests are `FindFading`, `FindStable`, `MarkSuperseded`, `MigrateToCold`, `MigrateToHot`, `ConvertToStub`, `UpdateRetention`, and `Clear`.
 
 ### 5.3 Diagnostics bucket
 
@@ -217,40 +187,45 @@ Response:
   "ok": true,
   "data": {
     "daemon_version": "0.1.0",
+    "protocol_version": 1,
+    "build_id": "0.1.0:/path/to/cm-daemon:...",
+    "instance": "cognitive-memory",
+    "daemon_pid": 12345,
+    "socket_path": ".../cm.sock",
+    "pid_path": ".../cm-daemon.pid",
+    "db_path": ".../data.db",
+    "log_path": ".../daemon.log",
     "uptime_seconds": 12345,
-    "memory_count": 4321,
-    "embedding_model": "bge-small-en-v1.5",
-    "providers": [{ "kind": "OpenAI", "configured": true }],
-    "background_tasks": [{ "name": "tick_scheduler", "last_run": "..." }]
+    "memory_count": 4321
   }
 }
 ```
 
-#### `Diagnostics::Trace`
+#### `Diagnostics::RecentTraces`
 
-Fetch a per-query trace by `trace_id`.
+Fetch recent entries from the bounded request trace ring.
 
 #### `Diagnostics::Doctor`
 
 Run health checks; return structured report.
 
-#### `Diagnostics::Version`
+#### `Diagnostics::Shutdown`
 
-Return daemon and protocol versions.
-
-#### `Diagnostics::Logs`
-
-Tail recent log lines.
+Ask the daemon to shut down gracefully.
 
 #### `Diagnostics::MintBridgeToken`
 
 Issue a bearer token for `cm-http` use.
 
 ```json
-{ "bucket": "Diagnostics", "op": "MintBridgeToken", "scopes": ["read", "write"], "ttl_seconds": 2592000 }
+{ "bucket": "Diagnostics", "op": "MintBridgeToken", "user_id": "default", "scope": "write", "ttl_seconds": 2592000 }
 ```
 
 Response: `{ "ok": true, "data": { "token": "cmb_..." } }`.
+
+#### `Diagnostics::ValidateBridgeToken`
+
+Validate a raw bridge token against daemon-owned token hashes. Used by `cm-http`.
 
 ## 6. Events
 
@@ -261,20 +236,18 @@ After `Memory::Subscribe`, the daemon pushes `Event` messages on the same connec
   "id": 0,
   "payload": {
     "kind": "Event",
-    "event": {
-      "kind": "MemoryStored",
-      "memory_id": "mem_01H...",
-      "user_id": "default",
-      "metadata": { "project": "lazydap", "source_agent": "claude-code" },
+    "body": {
+      "kind": "CurrentState",
+      "memory_count": 12,
       "occurred_at": "2026-05-07T12:34:56Z"
     }
   }
 }
 ```
 
-Event kinds in v1: `MemoryStored`, `MemoryUpdated`, `MemoryDeleted`, `MemoryExpired`, `TickCompleted`, `ConsolidationCompleted`, `ProviderRateLimited`.
+Event kinds in v1: `CurrentState`, `TickCompleted`, `EventStreamLagged`.
 
-Events are best-effort. A subscribed client missing events while disconnected does not get replay. Clients that need durable replay should poll `Memory::List` with `since` after reconnect, or pull from `events` table via `Diagnostics::ReplayEvents` (Phase 11).
+Events are best-effort. A subscribed client missing events while disconnected does not get replay. Clients that need durable replay should poll current state after reconnect; durable event replay is not in the v1 protocol surface.
 
 ## 7. Errors
 
@@ -317,6 +290,14 @@ Clients distinguish retriable from non-retriable via the `retriable` flag.
 
 The Rust definitions in `crates/protocol/` are the source of truth. The TS and Python SDK `RemoteAdapter`s mirror them by hand for now; codegen from a JSON Schema is a follow-up.
 
-## 10. Test fixtures
+## 10. Concurrency
 
-Phase 0 ships golden fixtures: a directory of `.json` request/response pairs that any client implementation can replay against the daemon (or a fake) for protocol-conformance tests. Location: `crates/protocol/tests/fixtures/`.
+Each accepted connection runs in its own tokio task. Inside that connection, individual requests run as child tasks, so one slow bulk request does not block a later hot request or subscribed events on the same socket. Responses may arrive out of order and are correlated by `id`.
+
+Hot requests use `REQUEST_CONCURRENCY_LIMIT = 64`; bulk lifecycle/diagnostic/batch operations use `BULK_CONCURRENCY_LIMIT = 8`.
+
+Lifecycle maintenance is explicit in this release: clients call `Lifecycle::Tick` through `cm tick` or IPC. Periodic scheduling remains an additive future surface.
+
+## 11. Test fixtures
+
+Golden fixtures live under `crates/protocol/tests/fixtures/`. Client implementations can replay them against the daemon or a fake for protocol-conformance tests.

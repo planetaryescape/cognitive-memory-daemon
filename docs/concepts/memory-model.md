@@ -75,17 +75,17 @@ The v6 retention formula `R = max(floor, exp(-Δt / (S · B · β_c)))` is compu
 
 Consolidation is reversible: a consolidated memory is a *new* row linked back to the source rows via `associations` of kind `inferred`. The originals are not deleted.
 
-Expiry is logical by default. Expired transient memories remain in the table but are filtered out of default retrieval. `Lifecycle::Expire { mode: "purge" }` is the only path that physically deletes rows.
+Expiry is logical by default. Expired transient memories remain in the table but are filtered out of default retrieval. The current v1 protocol exposes tier and lifecycle maintenance through `Lifecycle::Tick`, `MigrateToCold`, `MigrateToHot`, and `ConvertToStub`; a hard-purge expiry operation is a future additive surface, not a current request.
 
 Promotion is a write to `retention_floor` and (sometimes) `category = "core"`. The decision lives in `crates/lifecycle/src/promote.rs`.
 
 ## 5. SQLite specifics
 
-- One file: `data.db` next to the socket.
+- One canonical SQLite file: `data.db` in the active identity's data directory.
 - WAL mode, `synchronous = NORMAL`, `foreign_keys = ON`, `temp_store = MEMORY`.
 - Two pools (1 writer + 4 readers). Writes serialise inside the daemon; reads parallelise. Per-connection PRAGMAs set in pool init.
-- Vector storage: undecided in this doc; ADR lands in Phase 1. Default plan is dense blob in `memories.embedding` plus Rust-side cosine for queries; upgrade to `sqlite-vec` extension when query latency requires it.
-- Backup: `data.db` is portable. Copy with the daemon stopped; copying live needs SQLite's `.backup` API or a WAL-aware tool. Add `cm doctor backup` in Phase 13.
+- Vector storage: dense blob in `memories.embedding`, scored in Rust with cosine similarity. Hybrid retrieval uses SQLite FTS5/BM25 plus Reciprocal Rank Fusion.
+- Backup: `data.db` is portable. Copy with the daemon stopped; copying live needs SQLite's `.backup` API or a WAL-aware tool.
 
 ## 6. What this model does not include
 

@@ -6,12 +6,12 @@
 
 ## Context
 
-The daemon needs LLM API keys for extraction (`Memory::ExtractAndStore`, `Memory::Ingest`) and may need embedding-provider keys when a hosted embedding provider is the default or per-request override.
+The daemon needs provider keys for daemon-owned embedding today and for future daemon-owned LLM extraction. Earlier design notes named future `Memory::ExtractAndStore` / `Memory::Ingest` requests; the current v1 protocol does not expose those request kinds.
 
 Multiple sources can supply a key:
 - Daemon process environment at startup.
 - Daemon config file (`config.toml`).
-- Per-request override field in `Request::Memory(...)`.
+- Future per-request override fields in `Request::Memory(...)` if/when daemon-owned extraction is exposed.
 
 The user explicitly chose "both" — daemon-owned keys *and* per-request override. This ADR documents the precedence rules so behaviour is deterministic.
 
@@ -19,7 +19,7 @@ The user explicitly chose "both" — daemon-owned keys *and* per-request overrid
 
 For any given LLM or embedding provider, the key is resolved in this order (highest priority wins):
 
-1. **Per-request override** (`llm_override.api_key` or `embedding_override.api_key`, when non-null).
+1. **Per-request override** (`llm_override.api_key` or `embedding_override.api_key`, when that future field is present and non-null).
 2. **Process environment** (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc., as named in the provider's config).
 3. **Config file** (`llm.<provider>.api_key_env` resolves to an env var name; the value of that env var is the key — `config.toml` does not contain the key directly).
 4. **OS keychain** (Phase 13). Provider keys can be stored in the macOS Keychain via `cm key set <provider>`; the daemon reads from the keychain at startup or on first use.
@@ -69,4 +69,4 @@ If no source supplies a key, calls to that provider return `Response::Error { ki
 
 - `docs/operations/configuration.md` §5 (precedence cheat sheet).
 - `SECURITY.md` §2 T2 (key handling threat).
-- `PROTOCOL.md` (`llm_override`, `embedding_override` fields on `Memory::*` requests).
+- `PROTOCOL.md` for the current request catalogue. Add `llm_override` / `embedding_override` there when a request surface actually carries them.

@@ -61,7 +61,7 @@ cm import --from postgres://... --user-id default
 cm import --from jsonl:///path/to/export.jsonl --user-id default
 ```
 
-Each importer is a small program that reads the source schema, projects to the daemon's `Memory::Store` shape, and uses `Memory::Ingest` for dedup. Adding this is a few-day project once the daemon is stable.
+Each importer is a small program that reads the source schema, projects to the daemon's `Memory::Store` or `Memory::StoreBatch` shape, and lets the daemon's store/linking path preserve protocol invariants. Adding this is a few-day project once the daemon is stable.
 
 ## Alternatives considered
 

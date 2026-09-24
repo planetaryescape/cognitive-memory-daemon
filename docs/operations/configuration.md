@@ -1,135 +1,110 @@
 # Configuration
 
-The daemon resolves configuration in this order (later sources override earlier):
+The current daemon has a small configuration surface. Runtime topology mostly comes from environment variables; `config.toml` is for LLM provider selection and lifecycle tuning.
 
-1. Compiled-in defaults.
-2. Config file at `~/Library/Application Support/cognitive-memory/config.toml` (if it exists).
-3. Environment variables.
-4. Command-line flags to `cm-daemon`.
-5. Per-request overrides on individual `Request` payloads.
+## Config file
 
-## 1. Config file
+The daemon reads the active identity's config file:
 
-```toml
-# ~/Library/Application Support/cognitive-memory/config.toml
-
-[daemon]
-log_level = "info"           # error | warn | info | debug | trace
-request_concurrency_limit = 64
-shutdown_grace_seconds = 5
-
-[socket]
-# Override path. Default: ~/Library/Application Support/cognitive-memory/cm.sock
-path = ""
-
-[store]
-# Override DB path. Default: ~/Library/Application Support/cognitive-memory/data.db
-db_path = ""
-reader_pool_size = 4         # writer pool is always 1
-
-[embeddings]
-default_provider = "local"   # local | openai
-local_model = "bge-small-en-v1.5"
-cache_max_rows = 1_000_000
-
-[embeddings.openai]
-# Optional: enables OpenAI as default if default_provider = "openai"
-api_key_env = "OPENAI_API_KEY"
-default_model = "text-embedding-3-small"
-
-[llm]
-default_provider = "openai"  # openai | anthropic
-[llm.openai]
-api_key_env = "OPENAI_API_KEY"
-default_model = "gpt-4o-mini"
-rate_limit_rps = 10
-[llm.anthropic]
-api_key_env = "ANTHROPIC_API_KEY"
-default_model = "claude-haiku-4-5-20251001"
-rate_limit_rps = 10
-
-[lifecycle]
-tick_cadence_seconds = 21_600   # 6 h
-decay_model = "exponential"      # exponential | power
-beta_c_default = 1.0
-core_retention_floor = 0.6
-power_decay_gamma = 0.7
-
-[retrieval]
-default_alpha = 0.5              # exponent on retention factor in score
-default_limit = 10
-hybrid_default = false           # opt-in hybrid retrieval
-rerank_default = false
-
-[http_bridge]
-bind = "127.0.0.1:7472"
-token_default_ttl_seconds = 2_592_000   # 30 d
-cors_origins = []
+```text
+<config-dir>/<COGNITIVE_MEMORY_INSTANCE>/config.toml
 ```
 
-Every section is optional. Missing sections take defaults.
+Debug builds default to `cognitive-memory-dev`; release builds default to `cognitive-memory`. The base config directory comes from `dirs::config_dir()` unless `COGNITIVE_MEMORY_CONFIG_DIR` is set.
 
-## 2. Environment variables
+Supported shape:
 
-Variables override the config file. Use these in CI, ephemeral environments, or to keep secrets out of disk files.
+```toml
+[llm]
+provider = "none"
+
+# or:
+# provider = "openai"
+# api_key_env = "OPENAI_API_KEY"
+# model = "gpt-4o-mini"
+
+# or:
+# provider = "anthropic"
+# api_key_env = "ANTHROPIC_API_KEY"
+# model = "claude-haiku-4-5-20251001"
+
+# or, with the `local-llm` feature enabled:
+# provider = "local"
+# model_path = "/absolute/path/to/model.gguf"
+
+[lifecycle.base_decay_rates]
+semantic = 240.0
+episodic = 45.0
+core = 120.0
+procedural = inf
+```
+
+Every section is optional. Missing `[llm]` means heuristic conflict handling and no LLM consolidation. Missing `[lifecycle]` means the daemon uses the built-in tuned lifecycle defaults.
+
+Use the CLI for LLM edits:
+
+```sh
+cm config-get-llm
+cm config-set-llm none
+cm config-set-llm openai --api-key-env OPENAI_API_KEY --model gpt-4o-mini
+cm config-set-llm anthropic --api-key-env ANTHROPIC_API_KEY --model claude-haiku-4-5-20251001
+```
+
+## Environment variables
 
 | Variable | Purpose |
 | --- | --- |
-| `COGNITIVE_MEMORY_SOCKET_PATH` | Override socket path. |
-| `COGNITIVE_MEMORY_DB_PATH` | Override DB path. |
-| `COGNITIVE_MEMORY_LOG_LEVEL` | Override log level. |
-| `COGNITIVE_MEMORY_HTTP_BIND` | Override HTTP bridge bind. Loopback only; non-loopback values cause `cm-http` to refuse. |
-| `COGNITIVE_MEMORY_HTTP_CORS_ORIGINS` | Comma-separated CORS origins for `cm-http`. |
-| `COGNITIVE_MEMORY_LLM_PROVIDER` | Default LLM provider. |
-| `COGNITIVE_MEMORY_EMBEDDING_PROVIDER` | Default embedding provider. |
-| `OPENAI_API_KEY` | Picked up by the OpenAI provider (LLM and/or embeddings). |
-| `ANTHROPIC_API_KEY` | Picked up by the Anthropic provider. |
-| `RUST_LOG` | Standard `tracing-subscriber` filter; overrides `COGNITIVE_MEMORY_LOG_LEVEL`. |
+| `COGNITIVE_MEMORY_INSTANCE` | Runtime identity. Scopes config, data, runtime, cache, logs, PID, socket, and bridge-token paths. |
+| `COGNITIVE_MEMORY_SOCKET_PATH` | Socket path for `cm`, `cm-daemon`, and `cm-http`. Overrides only the socket path. |
+| `COGNITIVE_MEMORY_CONFIG_DIR` | Base config directory override. |
+| `COGNITIVE_MEMORY_DATA_DIR` | Base data directory override; `data.db` lives under this identity-scoped directory. |
+| `COGNITIVE_MEMORY_RUNTIME_DIR` | Base runtime directory override; socket and PID live under this identity-scoped directory unless socket/PID are explicitly overridden. |
+| `COGNITIVE_MEMORY_CACHE_DIR` | Base cache directory override. |
+| `COGNITIVE_MEMORY_LOG_DIR` | Base log directory override. |
+| `COGNITIVE_MEMORY_DB_PATH` | Daemon SQLite file override. Used by the CLI when auto-spawning. |
+| `COGNITIVE_MEMORY_PID_PATH` | Daemon PID file override. Used by the CLI when auto-spawning. |
+| `COGNITIVE_MEMORY_LOG_PATH` | Daemon log file override. Used by the CLI when auto-spawning. |
+| `COGNITIVE_MEMORY_LOG` | Tracing filter for `cm-daemon`; falls back to `RUST_LOG`. |
+| `COGNITIVE_MEMORY_EMBEDDINGS` | Set to `fake` for fast local/CI daemon runs without loading the local model. |
+| `COGNITIVE_MEMORY_DAEMON_BIN` | CLI auto-spawn override for the daemon binary path. Useful in source builds and tests. |
+| `RUST_LOG` | Standard tracing filter fallback. |
+| `OPENAI_API_KEY` | Read when config points OpenAI at this env var. |
+| `ANTHROPIC_API_KEY` | Read when config points Anthropic at this env var. |
+| `COGNITIVE_MEMORY_HTTP_BIND` | HTTP bridge bind address. Default `127.0.0.1:7472`; non-loopback values are refused. |
+| `COGNITIVE_MEMORY_HTTP_SALT` | Salt for the bridge's in-memory bearer-token hashes. |
+| `COGNITIVE_MEMORY_HTTP_BOOTSTRAP_TOKEN` | Registers a bridge token from env at startup. Handy for tests/local scripts. |
+| `COGNITIVE_MEMORY_HTTP_BOOTSTRAP_USER` | User namespace for the bootstrap token. Default `default`. |
+| `COGNITIVE_MEMORY_HTTP_BOOTSTRAP_SCOPE` | `read`, `write`, or `admin` for the bootstrap token. Default `write`. |
+| `COGNITIVE_MEMORY_HTTP_MINT_USER` | Ask the daemon to mint a bridge token at `cm-http` startup and write it to the private bridge-token file. |
+| `COGNITIVE_MEMORY_HTTP_MINT_SCOPE` | Scope for minted startup token. Default `write`. |
+| `COGNITIVE_MEMORY_HTTP_ALLOWED_HOSTS` | Extra accepted Host headers, comma-separated. Loopback hosts are accepted by default. |
+| `COGNITIVE_MEMORY_HTTP_ALLOWED_ORIGINS` | CORS origin allowlist, comma-separated. |
+| `COGNITIVE_MEMORY_HTTP_CORS_ORIGINS` | Backward-compatible alias for the CORS origin allowlist. |
 
-## 3. Command-line flags (daemon)
+## Command-line configuration
+
+`cm` has global flags:
 
 ```sh
-cm-daemon --foreground                # don't detach; log to stderr
-cm-daemon --config /path/to/config.toml
-cm-daemon --socket /path/to/cm.sock
-cm-daemon --log-level debug
+cm --socket /tmp/cm.sock --user-id alice status
+cm --socket /tmp/cm.sock --user-id alice --no-spawn search "..."
+cm --json counts
 ```
 
-Flags override env vars.
+`cm-daemon` accepts `--foreground`, `--instance`, `--socket`, `--db`, `--pid`, `--log`, and `--json-logs`. The CLI normally supplies these when it auto-spawns. `cm-http` uses environment variables for bind/Host/CORS/token setup.
 
-## 4. Per-request overrides
+## Precedence
 
-Most `Memory::*` requests accept `embedding_override` and `llm_override`:
+- Runtime identity: `COGNITIVE_MEMORY_INSTANCE`; otherwise release/debug default.
+- Socket path: CLI `--socket` for `cm`; otherwise `COGNITIVE_MEMORY_SOCKET_PATH`; otherwise the identity-scoped runtime default.
+- Daemon data path: `COGNITIVE_MEMORY_DB_PATH`; otherwise identity-scoped data dir `data.db`.
+- LLM provider: `config.toml`.
+- LLM API key: the env var named by `config.toml`.
+- HTTP bridge token source: local bootstrap token if present; otherwise daemon-minted tokens are validated against daemon-owned token storage per request. Startup mint writes a private token file for convenience.
 
-```json
-{
-  "bucket": "Memory",
-  "op": "Search",
-  "query": "...",
-  "embedding_override": {
-    "provider": "OpenAI",
-    "model": "text-embedding-3-large",
-    "api_key": null
-  }
-}
-```
+## Operator hygiene
 
-`api_key: null` means "use the daemon's configured key for this provider". A non-null `api_key` overrides the daemon's key for this single request only and is never persisted.
-
-## 5. Precedence reference
-
-| For this property | The winning source is | Then | Then | Then | Then |
-| --- | --- | --- | --- | --- | --- |
-| LLM API key | per-request override | env var (`OPENAI_API_KEY`, …) | config file `llm.<provider>.api_key_env` | (no key → request fails) | — |
-| Embedding provider | per-request override | env var `COGNITIVE_MEMORY_EMBEDDING_PROVIDER` | config `embeddings.default_provider` | compiled-in `local` | — |
-| Socket path | env `COGNITIVE_MEMORY_SOCKET_PATH` | `--socket` flag | config `socket.path` | compiled-in default | — |
-| Log level | `RUST_LOG` | env `COGNITIVE_MEMORY_LOG_LEVEL` | `--log-level` | config `daemon.log_level` | compiled-in `info` |
-
-The full precedence rules live in code at `crates/daemon/src/config.rs` (Phase 4) and are exercised by tests under `crates/daemon/tests/config_precedence.rs`.
-
-## 6. Operator hygiene
-
-- Treat `config.toml` as configuration, not secrets. Real keys belong in env vars or the OS keychain. The keyring path lands in Phase 13.
-- Don't commit `config.toml` to a repo. The defaults are sane; per-machine config goes in `~/Library/Application Support/cognitive-memory/`.
-- Changing the embedding model default requires a daemon restart and does not invalidate cached embeddings.
-- Changing the decay model (`exponential` ↔ `power`) takes effect immediately at next retrieval; stored memories are not rewritten.
+- Keep real provider keys in environment variables, not in `config.toml`.
+- Restart the daemon after changing `[llm]`.
+- Lifecycle overrides take effect on daemon restart because the config is loaded at startup.
+- Use a temporary `COGNITIVE_MEMORY_INSTANCE` and temp `COGNITIVE_MEMORY_*_DIR` overrides for smoke tests so you do not touch your real memory store.

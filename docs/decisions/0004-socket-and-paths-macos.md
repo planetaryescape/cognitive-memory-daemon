@@ -19,25 +19,25 @@ The user's primary platform is macOS. Linux is in-scope for later but not v1.
 
 | Asset | Path (macOS) |
 | --- | --- |
-| Socket | `~/Library/Application Support/cognitive-memory/cm.sock` |
-| PID file | `~/Library/Application Support/cognitive-memory/cm.pid` |
-| SQLite DB | `~/Library/Application Support/cognitive-memory/data.db` |
-| Embedding models | `~/Library/Application Support/cognitive-memory/models/` |
-| Daemon log | `~/Library/Logs/cognitive-memory/daemon.log` |
-| HTTP bridge log | `~/Library/Logs/cognitive-memory/http.log` |
-| Config file (optional) | `~/Library/Application Support/cognitive-memory/config.toml` |
+| Socket | Identity-scoped runtime dir, `cm.sock` |
+| PID file | Identity-scoped runtime dir, `cm-daemon.pid` |
+| SQLite DB | Identity-scoped data dir, `data.db` |
+| Embedding / LLM models | Identity-scoped cache dir, `models/` |
+| Daemon log | Identity-scoped log dir, `daemon.log` |
+| HTTP bridge token file | Identity-scoped config dir, `bridge-token.json` |
+| Config file (optional) | Identity-scoped config dir, `config.toml` |
 
 Parent directories: mode `0700`. Socket: `0700`. DB / PID / logs: `0600`. Created on daemon start with `umask 077`.
 
-Override: `COGNITIVE_MEMORY_SOCKET_PATH` (and per-asset env vars listed in `docs/operations/configuration.md` §2). All overrides validated against the same permission rules.
+Runtime identity: `COGNITIVE_MEMORY_INSTANCE` scopes every durable path. Release builds default to `cognitive-memory`; debug builds default to `cognitive-memory-dev`. Override individual roots and files with the per-asset env vars listed in `docs/operations/configuration.md` §2. All overrides are validated against the same permission rules.
 
-Linux fallback (when added): `$XDG_RUNTIME_DIR/cognitive-memory/cm.sock` for the socket, `$XDG_DATA_HOME/cognitive-memory/` (default `~/.local/share/cognitive-memory/`) for data, `$XDG_CACHE_HOME/cognitive-memory/` (default `~/.cache/cognitive-memory/`) for the model cache, `$XDG_STATE_HOME/cognitive-memory/` (default `~/.local/state/cognitive-memory/`) for logs.
+Linux uses the platform directories returned by `dirs` with the same identity scoping: runtime for socket/PID, data for `data.db`, cache for models, config for config/token files, and log dir fallback under cache/home when needed.
 
 ## Reasoning
 
 **Why `~/Library/Application Support/` and not `$TMPDIR/` for the socket?**
 - macOS reaps `$TMPDIR/` (`/var/folders/...`) periodically and on reboot. A socket living there would vanish, sometimes. Application Support is durable.
-- Socket and DB live in the same directory: `cm doctor` and uninstall instructions stay simple.
+- Socket/PID are runtime state; DB is durable data. `cm doctor` reports every resolved path so this split stays discoverable.
 
 **Why `~/Library/Application Support/` and not `~/.config/`?**
 - macOS convention. Tools that try to look like macOS-native belong in `Library/`. Mxr uses `Library/Application Support/mxr/`. The convention transfers.
@@ -58,12 +58,13 @@ Linux fallback (when added): `$XDG_RUNTIME_DIR/cognitive-memory/cm.sock` for the
 
 - One install location per user; uninstall is one `rm -rf`.
 - Predictable for documentation and `cm doctor` reporting.
+- Development builds cannot accidentally attach to release data unless `COGNITIVE_MEMORY_INSTANCE=cognitive-memory` is explicitly set.
 - Mxr-aligned, so tooling and habits transfer.
 - Linux paths follow XDG, the closest thing Linux has to a convention.
 
 ### Negative
 
-- Hardcoded paths require env-var override for non-standard installs (e.g., a sandboxed test environment wanting an isolated install). The override mechanism is the mitigation; tests use `COGNITIVE_MEMORY_SOCKET_PATH` plus a `tempfile::tempdir()` per test.
+- Hardcoded defaults require env-var override for non-standard installs (e.g., a sandboxed test environment wanting an isolated install). The override mechanism is the mitigation; tests use temp identity roots.
 - macOS `$HOME` resolution from a daemon spawned by a different process inherits the spawner's `$HOME`. Unlikely to bite given how `cm` spawns `cm-daemon` (same user, same env), but worth being aware of.
 
 ### Neutral

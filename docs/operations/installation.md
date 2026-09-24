@@ -1,67 +1,98 @@
 # Installation
 
-Pre-Phase-13 placeholder. The current state of the project is "documentation landed, code starts at Phase 0", so there is no binary to install yet. This page records the install plan so the implementation phase has a target to hit.
+The daemon is implemented and runnable from source. A v0.1.0 release tag has not been cut yet, so the reliable install path today is a local build.
 
-## Planned distribution channels
+## From source
 
-1. **`cargo install cognitive-memory-daemon`** — works as soon as the workspace publishes to crates.io (Phase 13).
-2. **Homebrew tap** — `brew install bhekanik/tap/cognitive-memory` for the typical Mac install. Tap repo TBD.
-3. **Pre-built binary releases** on the GitHub releases page (`cm-daemon`, `cm`, `cm-http`).
-4. **Docker image** — out of scope for v0.1.
+```sh
+git clone https://github.com/bhekanik/cognitive-memory.git
+cd cognitive-memory/cognitive-memory-daemon
+cargo build --workspace
+```
 
-## What gets installed
+The build produces three binaries:
+
+| Binary | Purpose |
+| --- | --- |
+| `target/debug/cm` | CLI client. Auto-spawns `cm-daemon` unless `--no-spawn` is set. |
+| `target/debug/cm-daemon` | Local Unix-socket daemon. Owns SQLite, embeddings, lifecycle, and IPC. |
+| `target/debug/cm-http` | Optional loopback HTTP bridge for clients that cannot speak Unix sockets. |
+
+## First run
+
+```sh
+target/debug/cm status
+target/debug/cm store "User prefers concise docs."
+target/debug/cm search "documentation preference"
+```
+
+`cm` probes the socket and starts `cm-daemon` if it is missing. The first run may spend time loading or downloading `bge-small-en-v1.5`; later calls reuse the daemon process and the shared embedding cache.
+
+## Runtime paths
+
+By default on macOS:
 
 | Path | Content |
 | --- | --- |
-| `$HOMEBREW_PREFIX/bin/cm` (or `~/.cargo/bin/cm`) | CLI binary |
-| `$HOMEBREW_PREFIX/bin/cm-daemon` | Daemon binary |
-| `$HOMEBREW_PREFIX/bin/cm-http` | HTTP bridge binary (optional service) |
-| `~/Library/Application Support/cognitive-memory/` | Created on first run (mode 0700) |
-| `~/Library/Application Support/cognitive-memory/data.db` | SQLite store (mode 0600), created on first run |
-| `~/Library/Application Support/cognitive-memory/cm.sock` | Unix socket, created on daemon start (mode 0700) |
-| `~/Library/Application Support/cognitive-memory/cm.pid` | PID file (single-instance via signal-probe — see ARCHITECTURE.md §3.2) |
-| `~/Library/Application Support/cognitive-memory/models/` | Embedding model files; populated on first embedding call |
-| `~/Library/Logs/cognitive-memory/daemon.log` | Daemon log (mode 0600) |
-| `~/Library/Logs/cognitive-memory/http.log` | HTTP bridge log if running |
+| Identity-scoped runtime dir, `cm.sock` | Unix socket. |
+| Identity-scoped runtime dir, `cm-daemon.pid` | PID file. |
+| Identity-scoped data dir, `data.db` | SQLite store. |
+| Identity-scoped config dir, `config.toml` | Optional daemon config file. |
+| Identity-scoped cache dir, `models/` | Local LLM downloads from `cm download-model`. |
+| Identity-scoped log dir, `daemon.log` | Daemon log file. |
 
-## First-run experience (target)
+Override the socket with:
 
 ```sh
-$ cm store "User dislikes mocked database tests."
-[cm-daemon starting in background...]
-[cm-daemon: downloading bge-small-en-v1.5 (130 MB)...]
-[cm-daemon ready]
-stored: mem_01HZ...
+COGNITIVE_MEMORY_SOCKET_PATH=/tmp/cm.sock target/debug/cm status
 ```
 
-The first call may take ~10 s while the model downloads. Subsequent calls are sub-100 ms.
-
-## Boot-time launch
-
-For agents that should always have memory available:
-
-- **macOS**: a `LaunchAgent` plist in `~/Library/LaunchAgents/com.bhekanik.cognitive-memory.plist`. Template ships in Phase 13.
-- **Linux**: a `systemd --user` unit. Phase 13.
-
-The daemon is fine to leave to auto-spawn on first CLI use too; the boot-time launch is for users who want subscription events delivered without the first agent paying the cold start.
-
-## Uninstall
+For an isolated full-state run, prefer a throwaway instance and temp dirs:
 
 ```sh
-# macOS, after launchd unload if applicable:
-brew uninstall cognitive-memory
-rm -rf ~/Library/Application\ Support/cognitive-memory
-rm -rf ~/Library/Logs/cognitive-memory
+tmp="$(mktemp -d)"
+COGNITIVE_MEMORY_INSTANCE=smoke \
+COGNITIVE_MEMORY_CONFIG_DIR="$tmp/config" \
+COGNITIVE_MEMORY_DATA_DIR="$tmp/data" \
+COGNITIVE_MEMORY_RUNTIME_DIR="$tmp/runtime" \
+COGNITIVE_MEMORY_CACHE_DIR="$tmp/cache" \
+COGNITIVE_MEMORY_LOG_DIR="$tmp/logs" \
+target/debug/cm status
 ```
 
-`cargo install` users: `cargo uninstall cognitive-memory-daemon` plus the same `rm` steps.
+## HTTP bridge
+
+Start the bridge only when you need HTTP:
+
+```sh
+target/debug/cm mint-token --scope write
+COGNITIVE_MEMORY_HTTP_BOOTSTRAP_TOKEN="<token>" target/debug/cm-http
+```
+
+The bridge binds `127.0.0.1:7472` by default and refuses non-loopback addresses.
+
+## Planned release channels
+
+- crates.io / `cargo install`
+- Homebrew formula from `packaging/homebrew/cognitive-memory.rb`
+- GitHub release tarballs for macOS and Linux
+
+Those artifacts are prepared in the repo, but the release has not been cut.
 
 ## Verification
 
-After install:
+For local development:
 
 ```sh
-cm doctor
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-Expected output: every check `OK`. Anything else is a bug; file an issue with the doctor report attached.
+For a quick live check, use an isolated socket:
+
+```sh
+tmp="$(mktemp -d)"
+COGNITIVE_MEMORY_SOCKET_PATH="$tmp/cm.sock" target/debug/cm status
+```

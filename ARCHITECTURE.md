@@ -9,7 +9,7 @@ This document is the load-bearing blueprint for `cognitive-memory-daemon`. Every
 That one sentence is the architecture. Everything below is how it manifests. Three supporting claims operationalise it:
 
 - **SQLite is the source of truth. Embedding cache, trace ring buffer, and in-RAM model are derived and rebuildable.** Anything derivable from SQLite can be discarded and rebuilt without data loss. Crash recovery falls out of this for free.
-- **The daemon serves reusable truth and lifecycle, not response payloads shaped for any particular UI.** The IPC contract describes facts a thinking client wants, not what a screen needs to render. Client-specific concerns (pane state, view shaping, selection state) never cross the wire — that's the fourth-bucket discipline (`ClientSpecific`).
+- **The daemon serves reusable truth and lifecycle, not response payloads shaped for any particular UI.** The IPC contract describes facts a thinking client wants, not what a screen needs to render. Client-specific concerns (pane state, view shaping, selection state) never cross the wire.
 - **Provider differences (LLM and embedding) are absorbed below the protocol surface in provider crates, but capability differences stay visible where behaviour actually differs.** A query that requires a paid model surfaces that, it does not silently fall back. Provider-agnostic at the data layer is not the same as flattening real behavioural differences.
 
 The 12 non-negotiable principles in [`AGENTS.md` §2](./AGENTS.md) operationalise this claim. In one breath:
@@ -34,7 +34,7 @@ Build-time enforcement of principles 1, 4, and 8 lives in `AGENTS.md` §3 (archi
 ### Goals
 
 1. **One memory, many agents.** Multiple AI clients on the same machine — Claude Code, Cursor, scripts, the TS and Python SDKs in remote mode — read and write a single shared cognitive memory store, with cross-agent visibility under a shared `user_id` namespace.
-2. **Local-first, owner-only.** Memory lives on the user's machine. The Unix socket is reachable only by the local user (mode 0700). No code path silently sends memory contents off-machine except through user-configured LLM and embedding providers.
+2. **Local-first, owner-only.** Memory lives on the user's machine. The Unix socket and runtime directory are reachable only by the local user. No code path silently sends memory contents off-machine except through user-configured LLM and embedding providers.
 3. **Always-on.** The daemon survives client restarts, idle periods, and OS suspends. State is durable across daemon restarts; only in-flight session state is ephemeral.
 4. **Stable wire protocol.** Clients and the daemon evolve independently behind a versioned, language-agnostic IPC contract. The protocol is the public surface; everything else is an implementation detail.
 5. **Single source of algorithmic truth.** v6 algorithms (decay, hybrid retrieval, graph expansion, instrumentation) live in this daemon. The TS and Python SDK `RemoteAdapter`s are thin clients; they don't re-implement scoring.
@@ -65,7 +65,7 @@ Build-time enforcement of principles 1, 4, and 8 lives in `AGENTS.md` §3 (archi
                           |                      |
                           +-----------+----------+
                                       |
-        Unix socket: ~/Library/Application Support/cognitive-memory/cm.sock (0700)
+        Unix socket: identity-scoped runtime dir / cm.sock (0700)
                                       |
                           +-----------v-----------+
                           |     cm-daemon         |
@@ -73,7 +73,8 @@ Build-time enforcement of principles 1, 4, and 8 lives in `AGENTS.md` §3 (archi
                           |  IPC accept + dispatch|
                           |  Embedding model RAM  |
                           |  LLM extractor + cache|
-                          |  Lifecycle scheduler  |
+                          |  Explicit lifecycle   |
+                          |  maintenance          |
                           |  Hybrid retrieval     |
                           |  Graph expansion      |
                           +-----------+-----------+
@@ -99,8 +100,8 @@ Build-time enforcement of principles 1, 4, and 8 lives in `AGENTS.md` §3 (archi
 
 ### 3.1 Two binaries, two roles
 
-- **`cm-daemon`** — long-running service. Owns the socket, store, embedding model, LLM extractor, lifecycle scheduler. Accepts client connections.
-- **`cm`** — client CLI. Subcommands: `store`, `search`, `get`, `list`, `tick`, `status`, `daemon` (lifecycle subcommand: `daemon start`, `daemon stop`, `daemon foreground`, `daemon status`). Auto-spawns `cm-daemon` if the socket is missing or stale.
+- **`cm-daemon`** — long-running service. Owns the socket, store, embedding model, LLM extractor, and lifecycle maintenance execution. Accepts client connections.
+- **`cm`** — client CLI. Subcommands include `store`, `search`, `get`, `list`, `tick`, `status`, `counts`, lifecycle helpers, and token/config helpers. Auto-spawns `cm-daemon` if the socket is missing unless `--no-spawn` is set.
 - **`cm-http`** — optional separate binary. HTTP loopback bridge. See §10.
 
 The daemon and CLI are the same Rust binary in some sense (one workspace), but ship as distinct executables so that `cm` stays small and starts fast.
@@ -113,15 +114,16 @@ Sequence when `cm <subcommand>` is invoked:
 
 1. Probe socket at the configured path.
 2. If reachable and protocol-compatible → connect, send request, return.
-3. If unreachable: stat the PID file. If a live PID exists with a matching process name, the daemon is starting up — poll for socket up to 2s, then connect.
-4. If no live PID: re-exec `cm-daemon` detached (double-fork, `setsid`, write PID file, redirect stdio to log file). Parent CLI returns control to its own subcommand path step 2.
-5. If the daemon repeatedly fails to come up, surface a clear error pointing to the log file and `cm doctor`.
+3. If unreachable: inspect the PID file. Dead PID/stale socket state is cleaned up; a live PID with a broken socket is terminated before restart.
+4. Spawn `cm-daemon --foreground` detached with the resolved instance, socket, DB, PID, and log paths.
+5. Poll `Diagnostics::Status` for up to 5s and confirm the daemon PID matches the spawned child.
+6. If startup fails, surface the daemon log path.
 
-PID file: `~/Library/Application Support/cognitive-memory/cm.pid`. Single-instance enforced by **signal-probe**: a starting daemon reads the PID file, sends `SIGZERO` (a no-op signal that returns success if the process exists, `ESRCH` otherwise) via `nix::sys::signal::kill`. A live PID means another daemon is running; the new one exits. A stale PID (process gone) is reclaimed and overwritten. This is the mxr pattern, vendored unchanged. Hard kills (`kill -9`) leave a stale PID file behind, which the next start reclaims cleanly.
+The daemon writes a PID file and refuses to bind over a reachable socket. A second daemon cannot delete the live socket out from under the first.
 
 ### 3.3 Shutdown
 
-Graceful: SIGTERM/SIGINT triggers a broadcast on a shutdown channel; accept loop stops accepting; in-flight requests finish (configurable deadline, default 5s); background tasks are signalled; pools drain; PID file removed; socket file removed; process exits.
+Graceful: Ctrl-C, `cm daemon stop`, or `Diagnostics::Shutdown` triggers a shutdown broadcast; the accept loop stops accepting; in-flight requests drain briefly; the socket and PID files are removed; process exits. Test harnesses use the same shutdown handle directly.
 
 ### 3.4 Crash recovery
 
@@ -133,12 +135,13 @@ If the daemon crashed mid-write the SQLite WAL recovers on next open. Migrations
 
 ### 4.1 Transport
 
-Unix domain socket, `SOCK_STREAM`. Mode 0700 on the socket (and parent directory). Owner-only access enforced by the OS.
+Unix domain socket, `SOCK_STREAM`. Mode 0700 on the socket and parent runtime directory. Owner-only access enforced by the OS.
 
 Path resolution order:
 1. `COGNITIVE_MEMORY_SOCKET_PATH` environment variable (if set).
-2. `~/Library/Application Support/cognitive-memory/cm.sock` (macOS).
-3. `$XDG_RUNTIME_DIR/cognitive-memory/cm.sock` (Linux fallback when added).
+2. Runtime identity from `COGNITIVE_MEMORY_INSTANCE`.
+3. Release default identity `cognitive-memory`; debug default identity `cognitive-memory-dev`.
+4. Platform runtime/data/config/cache/log roots from `dirs`, with explicit `COGNITIVE_MEMORY_*_DIR` overrides for tests and local harnesses.
 
 ### 4.2 Framing
 
@@ -163,14 +166,15 @@ enum IpcPayload {
 
 ### 4.4 Buckets
 
-Following mxr/lazydap discipline, four buckets prevent the protocol from drifting into a kitchen sink:
+Following mxr/lazydap discipline, three wire buckets prevent the protocol from drifting into a kitchen sink:
 
 | Bucket | Purpose | Examples |
 | --- | --- | --- |
-| `Memory` | CRUD on memories, search, ingest, extract | `Store`, `Search`, `Get`, `Update`, `Delete`, `Link`, `Ingest`, `ExtractAndStore` |
-| `Lifecycle` | Decay, consolidation, expiry, promotion | `Tick`, `Consolidate`, `Expire`, `PromoteToCore`, `DecayStats` |
-| `Diagnostics` | Status, traces, health | `Status`, `Trace`, `Doctor`, `Version`, `Logs` |
-| `ClientSpecific` | UI / pane state owned by clients | (never crosses the wire) |
+| `Memory` | Store, CRUD/listing, search, links, subscriptions | `Store`, `StoreBatch`, `Search`, `Get`, `List`, `Update`, `Delete`, `Link`, `VectorSearch`, `SearchLexical`, `BatchUpdate`, `Subscribe` |
+| `Lifecycle` | Explicit maintenance and tier operations | `Tick`, `FindFading`, `FindStable`, `MarkSuperseded`, `MigrateToCold`, `MigrateToHot`, `ConvertToStub`, `UpdateRetention`, `Clear` |
+| `Diagnostics` | Status, traces, health, shutdown, bridge tokens | `Status`, `RecentTraces`, `Doctor`, `Shutdown`, `MintBridgeToken`, `ValidateBridgeToken` |
+
+Client-specific UI/pane state is deliberately not a wire bucket.
 
 Adding a request type is mechanical; the `docs/developer/adding-a-request.md` recipe covers the steps. The bucket discipline is enforced by file layout (one module per bucket) and by code review.
 
@@ -182,7 +186,7 @@ In practice clients ship with a known protocol version baked in. Mismatches mean
 
 ### 4.6 Subscriptions
 
-Events do not flow until a client subscribes. After connection setup, a client may send `Request::Memory(MemoryRequest::Subscribe { kinds: Vec<EventKind> })`. The daemon then pushes matching events on that connection alongside any responses to other requests. The same connection multiplexes requests, responses, and events; consumers dispatch by `IpcPayload` variant.
+Events do not flow until a client subscribes. After connection setup, a client may send `Request::Memory(MemoryRequest::Subscribe { replay_snapshot: true })`. The daemon responds with `Subscribed` and, when requested, immediately pushes a `CurrentState` event. Later lifecycle events such as `TickCompleted` are delivered on the same connection. Consumers dispatch by `IpcPayload` variant.
 
 ## 5. Crate layout
 
@@ -196,7 +200,7 @@ crates/
 ├── search/            vector search + hybrid retrieval (BM25 via tantivy or FTS5)
 ├── embeddings/        local model (fastembed-rs), provider trait, cache
 ├── llm/               LLM provider trait (OpenAI, Anthropic), extractor, rate limit
-├── lifecycle/         decay, consolidation, expiry, tick scheduler
+├── lifecycle/         decay, consolidation, expiry, tick execution
 ├── graph/             association graph + n-hop expansion
 ├── client/            Rust client lib for tests; thin wrapper over protocol+codec
 ├── daemon/            binary `cm-daemon`: accept loop, dispatcher, handlers
@@ -238,7 +242,7 @@ Authoritative schema lives in `crates/store/migrations/`. High-level tables:
 | `embedding_cache` | provider, model, text_hash, embedding (BLOB) — shared cache across all clients |
 | `kv` | namespace, key, value — small daemon-owned config (current schema version, enabled features, etc.) |
 
-Vector storage detail is decided in Phase 1 — the leading candidate is `sqlite-vec` (extension loaded into the SQLite handle) for unified-storage simplicity; fallback is dense-store-plus-blob with cosine in Rust.
+Vector storage is a dense embedding blob in `memories.embedding`, scored in Rust with cosine similarity. Hybrid retrieval adds SQLite FTS5/BM25 and fuses dense plus lexical rankings with Reciprocal Rank Fusion.
 
 ### 6.3 Multi-tenancy
 
@@ -286,52 +290,48 @@ Rate limiting is a per-provider bucket inside the daemon, shared across all clie
 
 ## 9. Lifecycle
 
-The decay/maintenance pipeline ported from the v6 SDK. The daemon owns the schedule.
+The decay/maintenance pipeline ported from the v6 SDK. The daemon owns execution of lifecycle work; clients request it explicitly in this release.
 
 - **Decay**: `R = max(floor, exp(-Δt / (S · B · β_c)))` (or power-law variant per `decay_model` config). Computed lazily at retrieval time so storage doesn't churn; periodically materialised by `Tick` for stats.
 - **Consolidation**: reversible summarisation. Originals retained; consolidated form is a new memory linked to its sources.
 - **Expiry**: hard-filter expired transient memories from default retrieval; opt-in to surface them via `deep_recall=true`.
 - **Promotion**: emergent core-memory promotion on cross-session repeated retrieval, lifting the retention floor.
 
-The `Tick` request triggers a maintenance pass synchronously (for tools that want determinism) or asynchronously (default). The scheduler also runs `Tick` on a configurable cadence (default every 6h).
+The `Tick` request triggers a maintenance pass synchronously (for tools that want determinism) or asynchronously (default). A daemon-owned periodic scheduler is not part of the current release; it remains an additive future surface.
 
 ## 10. HTTP bridge
 
 `cm-http` is a separate binary. Bound to `127.0.0.1:7472` (default; configurable). Not exposed beyond loopback.
 
-- **AuthN**: per-request `Authorization: Bearer <token>`. Tokens are minted by the daemon on demand (`Diagnostics::MintBridgeToken`) and stored in `kv`. Tokens have an expiry (default 30d). Bridge holds tokens in memory and refreshes from the daemon on miss.
-- **AuthZ**: tokens are scoped to a `user_id` and an optional capability set (read-only, full).
-- **Wire format**: HTTP/JSON. URL paths mirror the request enum (`POST /memory/search`, `GET /memory/:id`, etc.). Body is the request payload. Responses are the response payload.
+- **AuthN**: per-request `Authorization: Bearer <token>`. Tokens can be minted by the daemon (`Diagnostics::MintBridgeToken`) and validated through `Diagnostics::ValidateBridgeToken`; env bootstrap remains available for tests/local scripts. The bridge's optional local token map stores salted hashes in memory.
+- **AuthZ**: tokens are scoped to a `user_id` and a capability (`read`, `write`, `admin`).
+- **HTTP hardening**: loopback bind only, Host-header allowlist, explicit CORS origin allowlist, and no HTTP listener in `cm-daemon`.
+- **Wire format**: HTTP/JSON. The current bridge exposes `POST /memory/store` and `POST /memory/search`.
 - **No event streaming over HTTP in v1.** SSE / WebSocket is a Phase 12 follow-up.
 
 Detail in `docs/concepts/http-bridge.md`.
 
 ## 11. Concurrency
 
-### 11.1 Request semaphore
+### 11.1 Request semaphores
 
-An accept-loop-wide semaphore (default `REQUEST_CONCURRENCY_LIMIT = 64`) caps concurrent in-flight requests. Mxr has the same. Prevents pathological client behaviour from exhausting handles.
+Hot requests use `REQUEST_CONCURRENCY_LIMIT = 64`; bulk lifecycle/diagnostic/batch operations use `BULK_CONCURRENCY_LIMIT = 8`. This keeps long maintenance or batch work from starving normal store/search/get traffic.
 
 ### 11.2 Per-client connection
 
-Each accepted connection runs in its own tokio task. Tasks read frames, dispatch, and write responses. Subscribed events are broadcast via `tokio::sync::broadcast` and per-connection filtered by subscribed kinds.
+Each accepted connection runs in its own tokio task. Individual requests on that connection run as child tasks, so a slow bulk tick does not block a later hot status/search or subscribed events on the same socket. Responses may arrive out of order and are correlated by request `id`. Subscribed events are broadcast via `tokio::sync::broadcast`; v1 subscriptions receive the connection snapshot plus lifecycle events.
 
 ### 11.3 Background tasks
 
-Spawned at startup, signalled by shutdown:
-- `lifecycle::tick_scheduler` — periodic decay materialisation, consolidation candidates.
-- `embeddings::cache_pruner` — bounded growth.
-- `llm::rate_window_advancer` — moves the rate-limit window forward.
-
-All background tasks log to the same tracing infrastructure as request handling.
+Lifecycle maintenance is explicit in the current release: callers use `Lifecycle::Tick` through `cm tick` or IPC. Tick runs through the bulk lane and logs/traces like any other request. A daemon-owned periodic scheduler is still a future additive surface.
 
 ## 12. Observability
 
-Tracing-first, mxr pattern. `tracing` from line one of `main`. Every request creates a span carrying `request_id`, `user_id`, request kind. Spans nest into store/search/llm/embedding child spans. Instrumented per-stage timings power `Diagnostics::Trace` (per-query trace introduced in v6 spec).
+Tracing-first, mxr pattern. `tracing` starts at daemon startup and writes to the identity-scoped daemon log. Every request is recorded in a bounded in-memory trace ring with request id, bucket, op, and elapsed time; `cm trace` exposes recent entries through `Diagnostics::RecentTraces`.
 
-- **Logs**: human-readable to stderr in foreground mode; JSON to `~/Library/Logs/cognitive-memory/daemon.log` in detached mode. Rotated by `tracing-appender` (daily, keep 14 days).
-- **Metrics**: Phase 11. Either a Prometheus endpoint on the bridge or `Diagnostics::Metrics` snapshot.
-- **Doctor**: `cm doctor` runs a battery of checks (socket reachable, DB writable, model loaded, providers reachable, time skew, disk space) and prints a structured report.
+- **Logs**: identity-scoped file at the status-reported log path; daemon stdio may be null when auto-spawned.
+- **Metrics**: not exposed yet.
+- **Doctor**: `cm doctor` runs socket, PID, DB, log, migration, and memory-count checks.
 
 ## 13. Security
 
@@ -348,7 +348,7 @@ Threat model and mitigations live in `SECURITY.md`. Highlights:
 The daemon is the canonical store for the daemon-mode deployment. The TS SDK and Python SDK ship a `RemoteAdapter` that:
 
 1. Resolves the socket path the same way the CLI does.
-2. Connects (auto-spawns daemon if not running).
+2. Connects to an already-running daemon.
 3. Serialises every existing `Adapter` method into a `Request::Memory(...)` call, awaits the matching `Response`, returns.
 
 The SDK's existing in-process adapters (InMemory, SQLite, Postgres, Convex) keep working unchanged; library users pick `RemoteAdapter` only when they want the daemon-mode shape.
@@ -357,7 +357,7 @@ When `RemoteAdapter` is in use, the SDK does *not* duplicate scoring, decay, hyb
 
 ## 15. What's not yet decided
 
-- Vector storage primitive: `sqlite-vec` extension vs flat blob + Rust cosine. Phase 1 calls.
-- Whether `cm` and `cm-daemon` are one binary with a `daemon` subcommand or two binaries built from the same workspace. Leaning two binaries for footprint reasons.
+- Whether SDK packages should export `RemoteAdapter` in the next published version or keep it source-only until the daemon is tagged.
 - Provider plugin loading. v1 is in-tree only.
-- Distribution: cargo-install, Homebrew tap, both. Phase 13.
+- Distribution order: crates.io, Homebrew tap, GitHub tarballs, or all three together.
+- Metrics surface: socket snapshot, bridge endpoint, or both.

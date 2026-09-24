@@ -17,7 +17,7 @@ Cognitive memory has a property the average request/response service does not: s
 
 ## Decision
 
-The protocol has three payload kinds in one envelope: `Request`, `Response`, `Event`. Events are pushed by the daemon on connections that have explicitly subscribed to event kinds. Requests carry a monotonic per-connection `id`; responses echo it; events use `id = 0`.
+The protocol has three payload kinds in one envelope: `Request`, `Response`, `Event`. Events are pushed by the daemon on connections that have explicitly sent `Memory::Subscribe`. Requests carry a monotonic per-connection `id`; responses echo it; events use `id = 0`.
 
 ## Reasoning
 
@@ -26,7 +26,7 @@ Why three payload kinds in one envelope rather than a separate event channel:
 - **Single connection per client.** Subscribers do not need to open a second socket. This keeps clients simple — open one connection, send `Hello`, optionally `Subscribe`, then exchange messages.
 - **Multiplexing is cheap on local IPC.** Unix-socket bandwidth is plentiful; any concern about events stomping on responses is overblown for the volumes we handle.
 - **Forward-compatibility.** A new event kind is a new variant in the `Event` enum. Existing clients ignore unknown variants. Adding events does not require new connections, new sockets, or new handshakes.
-- **`lazydap` validates the shape.** lazydap's `tokio::sync::broadcast` channel pattern with kind-filtered subscribers proved out the design in a sibling project.
+- **Sibling-project precedent.** The `tokio::sync::broadcast` channel pattern proved out well in sibling daemon projects. Cognitive-memory v1 keeps subscription simple: one `Subscribe` flag per connection, with event-kind filtering left as an additive future field.
 
 Why not full gRPC / JSON-RPC:
 

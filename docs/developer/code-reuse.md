@@ -26,7 +26,7 @@ Do not generalise across the three projects yet. Three is too few to justify a s
 | `crates/protocol/tests/round_trip.rs` | mxr equivalent if present, else write fresh from the fixture loader pattern | Loads every `tests/fixtures/*.json` and asserts round-trip. |
 
 What you're writing fresh in Phase 0:
-- The actual `Request` / `Response` / `Event` enum bodies — these are cognitive-memory-specific and live in the protocol crate's `memory.rs`, `lifecycle.rs`, `diagnostics.rs`, `event.rs`. The shape comes from `PROTOCOL.md`, not from mxr.
+- The actual `Request` / `Response` / `Event` enum bodies — these are cognitive-memory-specific and currently live in `crates/protocol/src/lib.rs`. The shape comes from `PROTOCOL.md`, not from mxr.
 - Golden fixtures under `crates/protocol/tests/fixtures/` — one per request kind from `PROTOCOL.md` §5.
 
 ## Phase 1 — Storage
@@ -68,13 +68,13 @@ This is the **largest** copy from mxr. Most of `crates/daemon/` plumbing is reus
 | `crates/daemon/src/ipc_client.rs` | mxr `crates/daemon/src/ipc_client.rs:14-67` | Client connection wrapper used by tests. Verbatim with renames. |
 | `crates/daemon/src/shutdown.rs` | mxr equivalent | Broadcast-channel shutdown signal. Background tasks subscribe; accept loop publishes on SIGTERM/SIGINT. |
 | `crates/daemon/src/concurrency.rs` (if separate) | mxr equivalent | Semaphore wrapper + per-request guard. |
-| Socket-path resolution | mxr `crates/config/src/resolve.rs:72-89` | Adapt the path defaults to cognitive-memory's (`~/Library/Application Support/cognitive-memory/cm.sock`); the resolution logic (env override → platform default) is the same shape. |
+| Runtime path resolution | mxr `crates/config/src/resolve.rs` + Obsidian `Runtime Identity Is a Data Boundary` | `crates/core/src/paths.rs` now resolves instance-scoped config/data/runtime/cache/log/socket/PID/DB/model-cache/bridge-token paths. Debug builds default to `cognitive-memory-dev`; release builds default to `cognitive-memory`; `COGNITIVE_MEMORY_INSTANCE` overrides both. |
 | PID file + signal-probe single-instance | `mxr/crates/daemon/src/server.rs` lines 463–492 (`daemon_pid_file_path`, `write_daemon_pid_file`, `read_daemon_pid_file`, `clear_daemon_pid_file`, plus `nix::sys::signal::kill` with `SIGZERO`) | Verbatim with renames. Mxr does not use `flock`; it uses signal-probe on the recorded PID. |
 | Tracing setup | mxr `crates/daemon/src/tracing.rs` (or wherever `init_tracing` lives) | Foreground vs detached split, JSON to file in detached, `tracing-appender` for rotation. Verbatim. |
-| Auto-spawn (re-exec daemon) | **Write fresh** from lazydap design docs and obsidian `How Daemons Work.md` | **Correction:** lazydap's daemon binary at `lazydap/crates/daemon/src/main.rs` is a 24-line placeholder (M5 not landed). Auto-spawn, broadcast events, and `--wait` are *documented* in lazydap's `ARCHITECTURE.md` and `docs/blueprint/` but not yet implemented as code. Write fresh per the documented design: probe socket → if absent, double-fork + setsid + redirect stdio + write PID file (signal-probe single-instance, ARCHITECTURE.md §3.2) → poll for socket up to 2s → connect. Mxr is manual-start so cannot be vendored here. |
+| Auto-spawn (re-exec daemon) | mxr + spotuify daemon lifecycle, adapted fresh | Current shape: probe socket → recover stale PID/socket if needed → spawn `cm-daemon --foreground` in a detached process group with identity-scoped paths → poll `Diagnostics::Status` and confirm the reported PID. No double-fork. |
 
 Adapt (same shape, cognitive-memory cases):
-- Handler implementations themselves (`handler/memory.rs`, `handler/lifecycle.rs`, `handler/diagnostics.rs`).
+- Handler implementations themselves (`crates/daemon/src/handlers.rs`; split by bucket later only if the file becomes too large).
 
 ## Phase 5 — CLI binary
 
@@ -82,7 +82,7 @@ Adapt (same shape, cognitive-memory cases):
 | --- | --- | --- |
 | `crates/cli/src/main.rs` | mxr CLI entrypoint | Clap subcommand setup, `--json` output flag, exit-code conventions. Adapt subcommands to cognitive-memory's (`store`, `search`, `get`, `list`, `tick`, `status`, `daemon`). |
 | Subcommand pattern | mxr `crates/daemon/src/commands/*.rs` | Each subcommand is one file, async function, takes parsed args, returns `Result<()>`. Pattern is verbatim. |
-| Auto-spawn integration | Write fresh — lazydap's CLI is placeholder; mxr does not auto-spawn. | Same as Phase 4 row above: probe socket, fork+exec daemon, poll up to 2s. |
+| Auto-spawn integration | mxr/spotuify lifecycle pattern, adapted fresh | `cm` uses `connect_or_spawn`: probe socket, recover broken daemon state, spawn detached daemon, poll status, then continue through normal IPC. |
 
 ## Phase 6 / 7 — SDK RemoteAdapter
 
@@ -112,7 +112,7 @@ Port from `cognitive-memory-sdk/sdks/python/src/cognitive_memory/extraction/` (o
 | Target | Source | Notes |
 | --- | --- | --- |
 | `cm doctor` battery | mxr's `mxr doctor` if implemented | Pattern: structured check list, each check returns `ok`/`warn`/`error` + message. Exit code from worst result. |
-| Per-query trace ring buffer | Write fresh, but use mxr's `tracing` patterns | The trace shape is in `PROTOCOL.md` §`Diagnostics::Trace`. |
+| Per-query trace ring buffer | Write fresh, but use mxr's `tracing` patterns | The trace shape is in `PROTOCOL.md` §`Diagnostics::RecentTraces`. |
 
 ## Phase 12 — HTTP bridge
 

@@ -1,140 +1,121 @@
 # Troubleshooting
 
-Common failure modes and the first diagnostic step. When in doubt: `cm doctor`, then check the log.
+Start with the simple checks. The daemon is local, so most failures are socket path, process, config, or first-run model load.
 
-## Daemon won't start
+## `cm` cannot connect
 
-### `cm` reports "daemon failed to come up"
-
-```
-$ cm status
-error: daemon socket not reachable; daemon failed to come up
-       see ~/Library/Logs/cognitive-memory/daemon.log
-```
-
-Diagnostic order:
-
-1. **Tail the log.** `tail -50 ~/Library/Logs/cognitive-memory/daemon.log`. The crash reason is almost always there.
-2. **Check the PID file.** `cat ~/Library/Application\ Support/cognitive-memory/cm.pid`. If a PID exists, the daemon signal-probes it on startup (sends `SIGZERO` via `nix::sys::signal::kill`); a live PID blocks a new start, a stale PID is reclaimed automatically. Manual cleanup (`rm cm.pid`) should not normally be needed; if you find it is, file a bug — the signal-probe path failed.
-3. **Check for port-equivalent collisions.** Another instance bound to the same socket path. `lsof ~/Library/Application\ Support/cognitive-memory/cm.sock` shows the holder.
-4. **Run in foreground.** `cm-daemon --foreground` shows tracing on stderr in real time.
-
-### `address already in use` on socket
-
-A previous daemon crashed without removing the socket file.
+Run with auto-spawn disabled to separate "daemon missing" from "request failed":
 
 ```sh
-rm ~/Library/Application\ Support/cognitive-memory/cm.sock
+cm --no-spawn status
 ```
 
-The new daemon will rebind. Permission errors here mean the file is owned by a different user; that's a deeper config issue.
-
-### Model download stalls
-
-Model is `bge-small-en-v1.5` from Hugging Face. First run downloads to `~/Library/Application Support/cognitive-memory/models/`. If the download stalls:
-
-1. Check connectivity to `huggingface.co`.
-2. Manually pre-download and place the ONNX file in the models dir; `fastembed-rs` picks it up.
-3. If you're offline by design, configure a hosted embedding provider as default in `config.toml`.
-
-## Requests fail
-
-### `ProtocolMismatch` error
-
-Daemon and client disagree on `IPC_PROTOCOL_VERSION`. Upgrade the lagging side.
+If that fails, either start the daemon yourself or let `cm` auto-spawn it:
 
 ```sh
-cm --version          # client (CLI) protocol version
-cm status             # daemon version + protocol if reachable
+cm status
+cm daemon start
 ```
 
-If the SDK is the lagging side: pin the SDK and daemon together to the same protocol version.
-
-### `NoLlmConfigured` on `Memory::ExtractAndStore`
-
-No LLM key resolves. Check precedence in [`configuration.md`](./configuration.md):
+For an isolated debug run:
 
 ```sh
-echo $OPENAI_API_KEY
-echo $ANTHROPIC_API_KEY
-cm doctor            # the providers section is the canonical answer
+tmp="$(mktemp -d)"
+COGNITIVE_MEMORY_SOCKET_PATH="$tmp/cm.sock" COGNITIVE_MEMORY_LOG=debug cm-daemon --foreground
+
+# another shell
+cm --socket "$tmp/cm.sock" --no-spawn status
 ```
 
-Either set the env var and restart the daemon, or attach `llm_override.api_key` per request.
+## Socket path confusion
 
-### `ProviderError` with `retriable: true`
+The daemon resolves socket, PID, DB, config, cache, model cache, bridge-token file, and logs from the active runtime identity. If you change only `--socket`, you are changing the socket endpoint; use the `COGNITIVE_MEMORY_*_DIR` overrides for isolated full-state runs.
 
-The provider returned a transient error (429, 5xx, network). The client should retry with backoff. The daemon already retries up to a small budget internally; reaching the client means the budget was exhausted.
+```sh
+COGNITIVE_MEMORY_INSTANCE=my-test cm status
+COGNITIVE_MEMORY_SOCKET_PATH=/tmp/cm.sock cm status
+```
 
-Look at the error `details.status` and `details.provider` to identify whether you need to throttle, switch model, or check provider status pages.
+Use `cm --json status` and `cm counts` to check whether you are looking at the expected store.
 
-### Searches return nothing
+## First run is slow
 
-Likely causes, in order:
+The default daemon build loads `bge-small-en-v1.5` through `fastembed-rs`. First run may download/load the model; later requests reuse the daemon process and cache.
 
-1. **Wrong `user_id`.** `Memory::Search` only sees memories under the connection's `user_id`. The CLI defaults to `default`; the SDK requires it explicit. Confirm by `cm list --user default | head` (or whatever `user_id` you stored under).
-2. **Validity filter.** Memories with `valid_until` in the past are hidden by default. Add `deep_recall: true` or `include_expired_transients: true`.
-3. **Embedding provider mismatch.** A search with `embedding_override` against an OpenAI model only finds memories whose embeddings exist under that `(provider, model)`. Phase-3-and-later behaviour around fallback/re-embedding is described in `docs/concepts/embedding-strategy.md` §4.
-4. **Empty store.** `cm doctor` shows `memory_count`. Zero is zero.
+For CI or fast local tests, build without default features so the daemon uses the deterministic fake embedding provider:
 
-## Performance feels off
+```sh
+cargo test --workspace --no-default-features
+```
 
-### Search > 200 ms
+## LLM features are disabled
 
-Hot daemon should be sub-100 ms. Slowness causes:
+If no `[llm]` section exists in `config.toml`, conflict handling falls back to heuristics and LLM consolidation is skipped.
 
-1. **Cold model.** First call after restart pays load cost. Subsequent calls are fast.
-2. **Cache miss embedding.** Search query was novel. Cache warm-up will help repeat queries.
-3. **Hybrid + rerank both on.** Disable rerank to confirm; rerank dominates if the LLM provider is slow.
-4. **Large candidate set.** Default `limit=10` and the daemon's pre-filter usually keep candidate sets small. Custom `limit > 200` plus graph expansion can blow this up.
+```sh
+cm config-get-llm
+cm config-set-llm none
+cm config-set-llm openai --api-key-env OPENAI_API_KEY --model gpt-4o-mini
+```
 
-`cm search "..." --trace` returns the per-stage timings (Phase 11+). Read the slowest stage; that's the answer.
+Restart the daemon after changing LLM config.
 
-### Daemon RAM growing without bound
+## Searches return nothing
 
-Expected steady-state: ~200–300 MB after model load and a few hundred memories. If RAM grows much beyond this:
+Likely causes:
 
-- Check `embeddings::cache_pruner` is running (`cm doctor` background tasks section).
-- Check trace ring buffer size; default 1000 is fine, larger custom values eat RAM.
-- File a bug with `tracing` heap profile attached.
+1. Wrong `user_id`. The CLI defaults to `default`; `--user-id` changes the namespace.
+2. Empty store. Check `cm counts`.
+3. Cold/superseded/expired filtering. Use deep recall when you intentionally want hidden historical memory.
+4. Query/memory mismatch. Use `cm search-lexical` to check whether the text exists lexically.
 
-## State is corrupted
+## HTTP bridge returns 401
 
-### `StorageError: SQLITE_CORRUPT`
+The bridge accepts daemon-minted tokens and env-bootstrapped local tokens. Mint a daemon token:
 
-Rare but possible after a hard crash on a filesystem with caching pathologies. Recovery:
+```sh
+cm mint-token --scope write
+```
 
-1. Stop the daemon.
-2. `sqlite3 ~/Library/Application\ Support/cognitive-memory/data.db "PRAGMA integrity_check"`.
-3. If the report is anything other than `ok`, dump and reload:
-   ```sh
-   sqlite3 data.db ".dump" > dump.sql
-   mv data.db data.db.broken
-   sqlite3 data.db < dump.sql
-   ```
-4. Restart the daemon.
+or ask the bridge to mint one at startup and write it to its private token file:
 
-Always keep `data.db.broken` until you've verified post-recovery state.
+```sh
+COGNITIVE_MEMORY_HTTP_MINT_USER=default cm-http
+```
 
-### Memories appear duplicated
+or bootstrap a dev token:
 
-The daemon does not enforce content-level dedup; identical content from two stores creates two memories. Use `Memory::Ingest` instead of raw `Store` for dedup-aware writes. Phase 10 wires this; until then, dedup is the client's responsibility if it matters.
+```sh
+COGNITIVE_MEMORY_HTTP_BOOTSTRAP_TOKEN=dev-token cm-http
+```
 
-## HTTP bridge
+Then call it with:
 
-### 401 Unauthorized
+```sh
+curl -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"test"}' \
+  http://127.0.0.1:7472/memory/search
+```
 
-Token invalid, expired, or never minted. Mint a new one via `Diagnostics::MintBridgeToken` (over the Unix socket).
+## HTTP bridge refuses to start
 
-### Bridge refuses to start
+`COGNITIVE_MEMORY_HTTP_BIND` must be loopback. Use `127.0.0.1:7472` or another `127.0.0.1:<port>` address.
 
-`COGNITIVE_MEMORY_HTTP_BIND` resolves to a non-loopback address. The bridge refuses by design (`SECURITY.md` §2 T5). Use `127.0.0.1:7472` or `localhost:7472`.
+## HTTP bridge returns 403
 
-## When to file a bug
+Likely causes:
 
-If `cm doctor` shows no warnings, the log shows no errors, and behaviour still surprises you, file a bug. Include:
+1. Token scope is too small for the route.
+2. Host header is not loopback and is not listed in `COGNITIVE_MEMORY_HTTP_ALLOWED_HOSTS`.
 
-- Daemon version (`cm --version`).
-- Full doctor output (`cm doctor --json`).
-- Reproduction steps as a sequence of `cm` invocations or SDK calls.
-- Last 100 lines of `daemon.log`, redacted.
+## What to include in a bug report
+
+- `cm --version`
+- `cm --json status`
+- `cm --json counts`
+- `cm --json doctor`
+- `cm --json trace`
+- The exact socket path used
+- Reproduction steps
+- Relevant daemon or bridge logs from a foreground run with `RUST_LOG=debug`

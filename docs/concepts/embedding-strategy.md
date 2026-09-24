@@ -57,7 +57,7 @@ The cache is shared across:
 - All clients (this is the whole point — agent A and agent B paying for the same conversation pay once).
 - All requests (a `Memory::Store` and a later `Memory::Search` on the same string both hit cache).
 
-Cache eviction: bounded by row count (default 1M). LRU pruning via `embeddings::cache_pruner` background task.
+Cache eviction: not automated in the current daemon release. The table is keyed for dedupe now; a bounded LRU/prune pass is still release-hardening work.
 
 ## 4. Dimension handling
 
@@ -67,13 +67,13 @@ Search sees mixed dimensions only if the user actively switches default models o
 
 - Searches by default use the daemon's default-provider embedding.
 - A search with `embedding_override` re-embeds the query under the override and searches against memories' embeddings *of the same provider+model*.
-- If a `(provider, model)` slice is sparse, the search may fall back to re-embedding stored memories on demand under the override, with results cached. Phase 3 calls this trade-off.
+- Searches only compare embeddings from the same `(provider, model)` slice. Cross-model fallback/re-embedding is not exposed in the current daemon.
 
 ## 5. Local model lifecycle
 
-- **First run**: model downloaded from Hugging Face on demand to `~/Library/Application Support/cognitive-memory/models/`. Daemon refuses to start in offline mode if the model is missing and no override is configured.
-- **Updates**: model file is content-addressed. A new model version is a new directory. `cm doctor` reports the active model and any newer one available on disk.
-- **Switching**: changing the default model via config requires a daemon restart. Changing requires no migration — old embeddings remain in cache under their `(provider, model)` key.
+- **First run**: `fastembed-rs` downloads/loads `bge-small-en-v1.5` into its cache. If the model is already cached, startup is quick.
+- **Updates**: model files are cache-managed by the provider library.
+- **Switching**: a new default model would require code/config work and a re-embedding story; the current default is `bge-small-en-v1.5`.
 
 ## 6. Future: local LLM extraction
 

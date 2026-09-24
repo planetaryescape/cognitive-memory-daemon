@@ -29,13 +29,14 @@ Browser / REST client
 +-------------------+
 ```
 
-The bridge holds one (or a small pool of) connections to the daemon. Per HTTP request:
+Per HTTP request:
 
-1. Validate `Authorization: Bearer <token>` against tokens minted by the daemon.
-2. Map URL path + method to a `Request` payload.
-3. Send the `Request` on a daemon connection.
-4. Await the matching `Response`.
-5. Translate the `Response` to an HTTP body and status.
+1. Validate Host header and `Authorization: Bearer <token>`.
+2. Accept the token from the bridge's local bootstrap map or validate it against daemon-owned token hashes.
+3. Map URL path + method to a `Request` payload.
+4. Send the `Request` on a daemon connection scoped to the token's `user_id`.
+5. Await the matching `Response`.
+6. Translate the `Response` to an HTTP body and status.
 
 ## 3. Bind and discoverability
 
@@ -47,24 +48,43 @@ The bridge holds one (or a small pool of) connections to the daemon. Per HTTP re
 
 ### 4.1 Token mint
 
-A client first asks the daemon (over Unix socket — the bridge does not exist yet from its perspective) to mint a token:
+Preferred path: ask the daemon over the Unix socket to mint a token:
 
 ```json
 {
   "id": 1,
   "payload": {
     "kind": "Request",
-    "request": { "bucket": "Diagnostics", "op": "MintBridgeToken", "scopes": ["read", "write"], "ttl_seconds": 2592000 }
+    "body": { "bucket": "Diagnostics", "op": "MintBridgeToken", "user_id": "default", "scope": "write", "ttl_seconds": 2592000 }
   }
 }
 ```
 
 Response:
 ```json
-{ "ok": true, "data": { "token": "cmb_<24-bytes-base64url>" } }
+{ "ok": true, "data": { "kind": "BridgeToken", "token": "cmb_<64-hex-chars>", "expires_at_unix": 1893456000 } }
 ```
 
-The token has at least 192 bits of entropy. It is shown to the user **once**; the daemon stores only a salted SHA-256 of the token in `kv`. Lost tokens are revoked and reminted, not recovered.
+`cm-http` can also mint and register a token at startup:
+
+```sh
+COGNITIVE_MEMORY_HTTP_MINT_USER=default \
+COGNITIVE_MEMORY_HTTP_MINT_SCOPE=write \
+cm-http
+```
+
+The startup-minted token is written to the private bridge token file reported by the active runtime identity. It is not written to logs.
+
+For tests and local scripts, bootstrap a token directly from env:
+
+```sh
+COGNITIVE_MEMORY_HTTP_BOOTSTRAP_TOKEN=dev-token \
+COGNITIVE_MEMORY_HTTP_BOOTSTRAP_USER=default \
+COGNITIVE_MEMORY_HTTP_BOOTSTRAP_SCOPE=write \
+cm-http
+```
+
+The token has at least 192 bits of entropy when minted by the daemon. The daemon stores only a salted SHA-256 of the token in `kv`. Lost tokens are revoked and reminted, not recovered.
 
 ### 4.2 Token use
 
@@ -75,16 +95,17 @@ Authorization: Bearer cmb_<token>
 ```
 
 The bridge:
-1. Hashes the token with the per-installation salt.
-2. Looks up the hash in `kv` via the daemon's `Diagnostics::ResolveBridgeToken` request (Phase 12 internal request, not in v1 client surface).
-3. Confirms the token is unexpired and has the required scope for the request.
-4. Forwards the request, attaching the token's `user_id` to the daemon `Hello` (the bridge maintains a separate daemon connection per `user_id`).
+1. Checks the Host header against loopback defaults or `COGNITIVE_MEMORY_HTTP_ALLOWED_HOSTS`.
+2. Checks its in-memory bootstrap token map.
+3. If not found locally, asks the daemon to validate the token via `Diagnostics::ValidateBridgeToken`.
+4. Confirms the token has the required scope for the request.
+5. Opens a daemon connection using the token's `user_id` and forwards the request.
 
 ### 4.3 Token scopes
 
-- `read`: can call `Memory::Search`, `Memory::Get`, `Memory::List`, `Diagnostics::Status`, `Diagnostics::Trace`.
-- `write`: in addition to read, can call `Memory::Store`, `Memory::Update`, `Memory::Delete`, `Memory::Link`, `Memory::Ingest`, `Memory::ExtractAndStore`, `Lifecycle::*` except destructive purge.
-- `admin`: in addition to write, can call `Lifecycle::Expire { mode: "purge" }`, `Diagnostics::MintBridgeToken`, `Diagnostics::Logs`.
+- `read`: can call read routes such as `/memory/search`.
+- `write`: can call read routes and write routes such as `/memory/store`.
+- `admin`: accepted by the token model; no admin-only HTTP routes are exposed yet.
 
 Scope set on mint; not changeable after.
 
@@ -97,22 +118,12 @@ Scope set on mint; not changeable after.
 
 ## 5. URL surface
 
-URL paths mirror the request enum so a competent reader can predict them.
+The current bridge intentionally exposes a small surface:
 
 | Method + path | Request |
 | --- | --- |
 | `POST /memory/store` | `Memory::Store` |
 | `POST /memory/search` | `Memory::Search` |
-| `GET /memory/:id` | `Memory::Get` |
-| `PATCH /memory/:id` | `Memory::Update` |
-| `DELETE /memory/:id` | `Memory::Delete` |
-| `GET /memory` | `Memory::List` |
-| `POST /memory/link` | `Memory::Link` |
-| `POST /memory/ingest` | `Memory::Ingest` |
-| `POST /memory/extract-and-store` | `Memory::ExtractAndStore` |
-| `POST /lifecycle/tick` | `Lifecycle::Tick` |
-| `GET /diagnostics/status` | `Diagnostics::Status` |
-| `POST /diagnostics/mint-bridge-token` | `Diagnostics::MintBridgeToken` (admin scope only) |
 
 Bodies are the request payloads from `PROTOCOL.md`. Response status codes:
 - 200: `Response { ok: true, ... }`.
@@ -129,8 +140,8 @@ Response body is the `Response` envelope as JSON.
 
 ## 6. Logging
 
-The bridge logs each request: timestamp, method, path, response status, latency, scope used, token prefix (first 8 chars). It **never** logs the full token or the request body content.
+The bridge logs startup configuration and rejected unknown bearer tokens. It does **not** log full tokens or request bodies. Per-request access logging is a later observability pass.
 
 ## 7. CORS
 
-By default, `cm-http` does not set CORS headers. The bridge is for tools running locally; serving a browser app from a different origin requires opt-in via `COGNITIVE_MEMORY_HTTP_CORS_ORIGINS` (comma-separated allow-list). No `*`-wildcard support.
+The bridge installs a CORS layer with an explicit origin allowlist. Configure it with `COGNITIVE_MEMORY_HTTP_ALLOWED_ORIGINS` or `COGNITIVE_MEMORY_HTTP_CORS_ORIGINS` as a comma-separated list. There is no wildcard origin.

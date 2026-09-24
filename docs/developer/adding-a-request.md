@@ -34,7 +34,7 @@ Errors: `NotFound`, `InvalidPayload`, `StorageError`.
 
 ## 3. Add the variant to the protocol enum
 
-In `crates/protocol/src/memory.rs`:
+In `crates/protocol/src/lib.rs`:
 
 ```rust
 pub enum MemoryRequest {
@@ -52,19 +52,19 @@ pub enum MemoryResponseData {
 
 ## 4. Add a fixture
 
-`crates/protocol/tests/fixtures/memory_pin_request.json`:
+`crates/protocol/tests/fixtures/requests/memory_pin.json`:
 
 ```json
 {
   "id": 1,
   "payload": {
     "kind": "Request",
-    "request": { "bucket": "Memory", "op": "Pin", "memory_id": "mem_01H1234567890", "floor": 0.8 }
+    "body": { "bucket": "Memory", "op": "Pin", "memory_id": "mem_01H1234567890", "floor": 0.8 }
   }
 }
 ```
 
-`crates/protocol/tests/fixtures/memory_pin_response.json`:
+`crates/protocol/tests/fixtures/responses/memory_pinned.json`:
 
 ```json
 {
@@ -77,7 +77,7 @@ The round-trip test in `crates/protocol/tests/round_trip.rs` picks these up auto
 
 ## 5. Implement the handler
 
-In `crates/daemon/src/handler/memory.rs`:
+In `crates/daemon/src/handlers.rs`:
 
 ```rust
 async fn handle_pin(state: &AppState, memory_id: MemoryId, floor: f32) -> Result<MemoryResponseData, Error> {
@@ -101,7 +101,7 @@ match request {
 
 ## 6. Implement the store method
 
-In `crates/store/src/memory_repo.rs`:
+In `crates/store/src/repos.rs`:
 
 ```rust
 impl MemoryRepo {
@@ -116,8 +116,8 @@ Use the writer pool (mutating). Errors typed via `StoreError` and `?`-propagated
 ## 7. Test
 
 - **Unit** test the handler with a fake `MemoryRepo` (errors-only path that doesn't need the trait — handler is small enough that an integration test covers it adequately).
-- **Integration** test the repo against a real SQLite (`crates/store/tests/pin_memory.rs`).
-- **End-to-end** test in `crates/daemon/tests/e2e_pin.rs`: store a memory, pin it with floor 0.8, search and confirm `retention_floor == 0.8` in the result.
+- **Integration** test the repo against a real SQLite (`crates/store/tests/storage.rs` or a focused new file).
+- **End-to-end** test in `crates/daemon/tests/e2e.rs` or a focused new file: store a memory, pin it with floor 0.8, search and confirm `retention_floor == 0.8` in the result.
 
 ## 8. Update the CLI (if exposing)
 
