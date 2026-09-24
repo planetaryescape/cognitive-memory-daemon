@@ -48,7 +48,6 @@ cognitive-memory-daemon/
 ├── ROADMAP.md               implementation phases
 ├── SECURITY.md              threat model, socket perms, key handling
 ├── AGENTS.md                rules for AI agents working on this codebase
-├── CLAUDE.md                Claude-specific entry; defers to AGENTS.md
 ├── CONTRIBUTING.md          how to contribute, code style, PR flow
 ├── docs/
 │   ├── concepts/            deeper dives on individual subsystems

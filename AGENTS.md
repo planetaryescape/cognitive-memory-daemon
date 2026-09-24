@@ -2,8 +2,6 @@
 
 Instructions for AI agents (Claude Code, Cursor, Codex, etc.) working in this repository. Humans and agents read the same file. If you're a human contributor, this is also the operating manual.
 
-`CLAUDE.md` defers here. There is no separate Claude-specific guidance.
-
 ## 1. Read first
 
 Before changing anything beyond a typo:
@@ -16,7 +14,7 @@ Before changing anything beyond a typo:
 
 If a doc and the code disagree, fix one of them in the same commit. Do not leave the disagreement.
 
-## 2. Core principles (NON-NEGOTIABLE)
+## 2. Core principles
 
 The 12 claims that anchor every implementation decision in this repo. Any change must respect them; cite them in code review when one is at stake. The architectural rules in §3 are the build-time enforcement scaffolding for principles 1, 4, and 8.
 
@@ -65,16 +63,12 @@ Documentation in this repo is load-bearing. The user explicitly asked for the do
 
 ## 5. Coding style
 
-Default to Rust idioms. The specific rules:
-
 - `cargo fmt` is enforced. `rustfmt.toml` is the law.
 - `cargo clippy -- -D warnings` is enforced. Don't `#[allow(clippy::...)]` without a comment explaining why.
 - `unwrap()` and `expect()` are allowed in tests, in `main.rs` initialisation paths, and inside `// SAFETY:` blocks. Anywhere else, use `?` and propagate.
 - Errors are typed (`thiserror` for libraries, `anyhow` only at binary boundaries).
 - No `unsafe` without a `// SAFETY:` block explaining the invariant.
 - Async by default in I/O code. CPU-bound code is sync; the daemon spawns it on `tokio::task::spawn_blocking` if necessary.
-- Module names are nouns. Function names are verbs. Types are nouns or adjectives.
-- One type per file is not a rule. One concept per file usually is.
 
 ## 6. Testing
 
@@ -97,32 +91,25 @@ If you're picking up a phase from `ROADMAP.md`:
 2. Don't add scope from later phases. If you find yourself wanting Phase 10's extraction code while doing Phase 4's dispatcher, stop — the phasing exists because earlier phases shake out the API for later ones.
 3. If a phase's design needs to change after you start it, propose the change in an ADR before writing the code that depends on it.
 
-## 8. Commits
-
-- Conventional commit prefixes (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`).
-- One logical change per commit. A phase usually maps to many commits.
-- No Co-Authored-By footer. No Claude/AI attribution. The user has codified this preference.
-- Body explains *why*, not *what*. The diff already shows what.
-
-## 9. Pull requests
+## 8. Pull requests
 
 - PR description references the relevant ROADMAP phase and any ADRs that govern the change.
 - A PR that touches the wire protocol updates `PROTOCOL.md`, the affected SDK protocol mirror, and adds a fixture under `crates/protocol/tests/fixtures/`.
 - A PR that introduces a new dependency justifies it. Default: don't add a dependency for what `std` does adequately.
 - A PR with new tests records rubric scores for those tests in the description (per `docs/developer/test-discipline.md`).
 
-## 10. When in doubt
+## 9. When in doubt
 
 The four reference projects to learn the pattern from:
 
 - `mxr` at `/Users/bhekanik/code/planetaryescape/mxr` — production-grade Rust daemon-pattern email client. Two-pool SQLite, length-delimited JSON, four-bucket protocol, idempotent migrations, no auto-spawn. This is the style template *and the source of vendored code*. See `docs/developer/code-reuse.md`.
-- `lazydap` at `/Users/bhekanik/code/planetaryescape/lazydap` — same pattern for a debugger. Auto-spawn, broadcast events, `--wait` async-to-sync bridge, dry-run mutations. Source of the auto-spawn and event-broadcast *design*; the lazydap daemon itself is a placeholder, so we write fresh from its docs.
+- `lazydap` at `/Users/bhekanik/code/planetaryescape/lazydap` — same pattern for a debugger. Auto-spawn, broadcast events, `--wait` async-to-sync bridge, dry-run mutations. Source of the auto-spawn and event-broadcast *design*.
 - `cognitive-memory-sdk` next door — the algorithmic source of truth for v6 features being ported into this daemon.
 - The user's Obsidian vault has a topic note `Cognitive Memory Daemon.md` (and the broader `The Local Daemon Pattern.md`, `Headless Core + Multiple Clients.md`, `How Daemons Work.md`, `Local IPC vs HTTP.md`) — read those if you want the conceptual framing, not the implementation.
 
 **Vendoring discipline** (codified in [ADR 0009](./docs/decisions/0009-vendor-mxr-lazydap-not-shared-crate.md)): when copying code from mxr or lazydap, copy whole files, mark provenance in a top-of-file comment (`// Adapted from mxr <commit-sha>:<path>`), do mechanical renames in the same commit, and file upstream issues for bug fixes that apply both places. Do not extract a shared crate yet — three projects is too few; revisit at five.
 
-## 11. Out of scope (do not do without asking)
+## 10. Out of scope (do not do without asking)
 
 - Implementing distributed memory or multi-machine sync.
 - Adding a network listener that binds anything other than `127.0.0.1` or a Unix socket.
