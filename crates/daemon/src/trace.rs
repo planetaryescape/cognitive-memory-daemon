@@ -1,9 +1,8 @@
 //! Per-query trace ring buffer.
 //!
 //! Bounded in-memory ring (default 1000 entries). Each request handler
-//! pushes one `Trace` entry on completion. Diagnostic clients fetch by
-//! `trace_id` via `Diagnostics::Trace` (Phase 11+, wiring lands when the
-//! request kind is added to the protocol).
+//! pushes one `Trace` entry on completion. `Diagnostics::RecentTraces`
+//! exposes recent entries to the CLI.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -50,6 +49,14 @@ impl TraceRing {
     pub fn get(&self, trace_id: &str) -> Option<Trace> {
         let guard = self.inner.lock().ok()?;
         guard.iter().rev().find(|t| t.trace_id == trace_id).cloned()
+    }
+
+    pub fn recent(&self, limit: usize) -> Vec<Trace> {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        guard.iter().rev().take(limit).cloned().collect()
     }
 
     pub fn len(&self) -> usize {

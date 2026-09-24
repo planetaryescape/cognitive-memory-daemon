@@ -1,0 +1,11 @@
+{
+  "id": 21,
+  "payload": {
+    "kind": "Request",
+    "body": {
+      "bucket": "Diagnostics",
+      "op": "RecentTraces",
+      "limit": 5
+    }
+  }
+}

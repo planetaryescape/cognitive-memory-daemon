@@ -1,12 +1,10 @@
 //! Vector retrieval for cognitive-memory-daemon.
 //!
-//! Phase 3 (this crate): pure vector search via cosine similarity over the
-//! `memories.embedding` column. Score = cosine; the retention factor `R^alpha`
-//! that the v6 spec calls for lands when Phase 8 (lifecycle) wires in.
+//! Dense vector search via cosine similarity over `memories.embedding`,
+//! plus optional BM25 hybrid retrieval fused with Reciprocal Rank Fusion.
 //!
-//! Hybrid retrieval (BM25 fused with dense via RRF) and per-query traces are
-//! follow-on work; the Searcher's interface is shaped to accept those without
-//! breaking callers.
+//! Final score is `similarity * R^alpha`, where `R` is the lifecycle
+//! retention value and `alpha` comes from the lifecycle config.
 
 mod cosine;
 mod hybrid;

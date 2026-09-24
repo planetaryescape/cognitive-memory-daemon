@@ -8,16 +8,18 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use cognitive_memory_client::Client;
+use cognitive_memory_core::RuntimePaths;
 use cognitive_memory_protocol::{
     BatchMemoryEntry, BatchUpdateArgs, BridgeScope, ClearArgs, ConvertToStubArgs, CountsArgs,
     DeleteManyMemoryArgs, DeleteMemoryArgs, DiagnosticsRequest, FindFadingArgs, FindStableArgs,
     GetLinkedArgs, GetLinkedManyArgs, GetManyMemoryArgs, GetMemoryArgs, LifecycleRequest,
     LinkMemoryArgs, ListMemoryArgs, MarkSupersededArgs, MemoryRequest, MigrateToColdArgs,
-    MigrateToHotArgs, MintBridgeTokenArgs, Request, Response, ResponseData, RetentionUpdate,
-    SearchLexicalArgs, SearchMemoryArgs, StoreBatchArgs, StoreMemoryArgs, TickArgs,
-    UnlinkMemoryArgs, UpdateMemoryArgs, UpdateRetentionArgs,
+    MigrateToHotArgs, MintBridgeTokenArgs, RecentTracesArgs, Request, Response, ResponseData,
+    RetentionUpdate, SearchLexicalArgs, SearchMemoryArgs, StoreBatchArgs, StoreMemoryArgs,
+    TickArgs, UnlinkMemoryArgs, UpdateMemoryArgs, UpdateRetentionArgs,
 };
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -47,6 +49,21 @@ struct Cli {
 enum Command {
     /// Show daemon status (uptime, memory count, version).
     Status,
+
+    /// Manage the resident daemon process.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+
+    /// Run health checks against the daemon and its local state.
+    Doctor,
+
+    /// Show recent daemon request traces.
+    Trace {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 
     /// Per-user tier counts (hot/cold/stub/total).
     Counts,
@@ -294,6 +311,22 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum DaemonCommand {
+    /// Start the daemon if it is not already running.
+    Start {
+        /// Run cm-daemon in the foreground.
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop the running daemon.
+    Stop,
+    /// Stop and start the daemon.
+    Restart,
+    /// Show daemon status.
+    Status,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -302,6 +335,10 @@ async fn main() -> Result<()> {
     // need a daemon connection (the daemon reads its config at next
     // startup), so handle them first and exit.
     match &cli.command {
+        Command::Daemon { command } => {
+            let paths = runtime_paths(cli.socket.clone());
+            return run_daemon_command(command, &paths, &cli.user_id, cli.json).await;
+        }
         Command::DownloadModel { model } => {
             return run_download_model(model).await;
         }
@@ -324,8 +361,9 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
-    let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
-    let mut client = connect_or_spawn(&socket, &cli.user_id, !cli.no_spawn)
+    let paths = runtime_paths(cli.socket.clone());
+    let socket = paths.socket_path.clone();
+    let mut client = connect_or_spawn(&paths, &cli.user_id, !cli.no_spawn)
         .await
         .with_context(|| format!("connect to daemon at {}", socket.display()))?;
 
@@ -338,6 +376,12 @@ async fn run_command(client: &mut Client, cli: &Cli) -> Result<Response> {
     let user = cli.user_id.clone();
     let req = match &cli.command {
         Command::Status => Request::Diagnostics(DiagnosticsRequest::Status),
+        Command::Doctor => Request::Diagnostics(DiagnosticsRequest::Doctor),
+        Command::Trace { limit } => {
+            Request::Diagnostics(DiagnosticsRequest::RecentTraces(RecentTracesArgs {
+                limit: *limit,
+            }))
+        }
         Command::Counts => {
             Request::Diagnostics(DiagnosticsRequest::Counts(CountsArgs { user_id: user }))
         }
@@ -634,7 +678,10 @@ async fn run_command(client: &mut Client, cli: &Cli) -> Result<Response> {
         // These three are detoured at the top of `main` and never
         // reach `run_command`. The arms exist only so the match is
         // exhaustive; reaching them is a programming error.
-        Command::DownloadModel { .. } | Command::ConfigGetLlm | Command::ConfigSetLlm { .. } => {
+        Command::Daemon { .. }
+        | Command::DownloadModel { .. }
+        | Command::ConfigGetLlm
+        | Command::ConfigSetLlm { .. } => {
             unreachable!("local-only commands are handled in main() before daemon dispatch");
         }
     };
@@ -681,10 +728,48 @@ fn print_human(resp: &Response) {
         Some(ResponseData::Status(s)) => {
             let _ = writeln!(
                 out,
-                "daemon: {} (memories: {}, uptime: {})",
+                "daemon: {} pid={} instance={} (memories: {}, uptime: {})",
                 s.daemon_version,
+                s.daemon_pid,
+                s.instance,
                 s.memory_count,
                 format_uptime(s.uptime_seconds)
+            );
+            let _ = writeln!(out, "socket: {}", s.socket_path);
+            let _ = writeln!(out, "pid:    {}", s.pid_path);
+            let _ = writeln!(out, "db:     {}", s.db_path);
+            let _ = writeln!(out, "log:    {}", s.log_path);
+        }
+        Some(ResponseData::Doctor(d)) => {
+            let _ = writeln!(out, "doctor: exit_code={}", d.exit_code);
+            for check in &d.checks {
+                let _ = writeln!(out, "{:?}\t{}\t{}", check.level, check.name, check.message);
+            }
+        }
+        Some(ResponseData::RecentTraces(t)) => {
+            if t.traces.is_empty() {
+                let _ = writeln!(out, "(no traces)");
+            } else {
+                for trace in &t.traces {
+                    let _ = writeln!(
+                        out,
+                        "{:.1}ms\t{}\t{}\t{}",
+                        trace.elapsed_ms, trace.trace_id, trace.bucket, trace.op
+                    );
+                }
+            }
+        }
+        Some(ResponseData::Shutdown(s)) => {
+            let _ = writeln!(out, "shutdown accepted: {}", s.accepted);
+        }
+        Some(ResponseData::Subscribed(s)) => {
+            let _ = writeln!(out, "subscribed (snapshot: {})", s.replay_snapshot_sent);
+        }
+        Some(ResponseData::BridgeTokenValidated(v)) => {
+            let _ = writeln!(
+                out,
+                "token valid: user={} scope={:?} expires_at_unix={}",
+                v.user_id, v.scope, v.expires_at_unix
             );
         }
         Some(ResponseData::Counts(c)) => {
@@ -785,11 +870,101 @@ fn print_human(resp: &Response) {
     }
 }
 
-fn default_socket_path() -> PathBuf {
-    dirs::data_dir()
-        .expect("data dir resolvable")
-        .join("cognitive-memory")
-        .join("cm.sock")
+fn runtime_paths(socket_override: Option<PathBuf>) -> RuntimePaths {
+    let mut paths = RuntimePaths::resolve();
+    if let Some(socket) = socket_override {
+        paths.socket_path = socket;
+    }
+    paths
+}
+
+#[allow(clippy::print_stdout)]
+async fn run_daemon_command(
+    command: &DaemonCommand,
+    paths: &RuntimePaths,
+    user_id: &str,
+    as_json: bool,
+) -> Result<()> {
+    match command {
+        DaemonCommand::Start { foreground: true } => {
+            let bin = daemon_bin_path();
+            let status = std::process::Command::new(&bin)
+                .arg("--foreground")
+                .env("COGNITIVE_MEMORY_INSTANCE", &paths.instance)
+                .env("COGNITIVE_MEMORY_SOCKET_PATH", &paths.socket_path)
+                .env("COGNITIVE_MEMORY_DB_PATH", &paths.db_path)
+                .env("COGNITIVE_MEMORY_PID_PATH", &paths.pid_path)
+                .env("COGNITIVE_MEMORY_LOG_PATH", &paths.daemon_log_path)
+                .status()
+                .with_context(|| format!("run {}", bin.display()))?;
+            if !status.success() {
+                anyhow::bail!("daemon exited with {status}");
+            }
+        }
+        DaemonCommand::Start { foreground: false } => {
+            if let Ok(mut client) = Client::connect(&paths.socket_path, "cm-cli", user_id).await {
+                let resp = client
+                    .request(Request::Diagnostics(DiagnosticsRequest::Status))
+                    .await?;
+                print_response(as_json, &resp)?;
+                return Ok(());
+            }
+            recover_broken_daemon(paths).await?;
+            let pid = spawn_daemon(paths)?;
+            wait_for_daemon_ready(paths, Some(pid), Duration::from_secs(5)).await?;
+            println!("daemon started: pid={pid}");
+            println!("socket: {}", paths.socket_path.display());
+            println!("log:    {}", paths.daemon_log_path.display());
+        }
+        DaemonCommand::Stop => {
+            let mut client = Client::connect(&paths.socket_path, "cm-cli", user_id)
+                .await
+                .with_context(|| "daemon is not running")?;
+            let resp = client
+                .request(Request::Diagnostics(DiagnosticsRequest::Shutdown))
+                .await?;
+            print_response(as_json, &resp)?;
+            wait_for_daemon_exit(paths, Duration::from_secs(5)).await?;
+        }
+        DaemonCommand::Restart => {
+            if let Ok(mut client) = Client::connect(&paths.socket_path, "cm-cli", user_id).await {
+                let _ = client
+                    .request(Request::Diagnostics(DiagnosticsRequest::Shutdown))
+                    .await;
+                let _ = wait_for_daemon_exit(paths, Duration::from_secs(5)).await;
+            } else {
+                recover_broken_daemon(paths).await?;
+            }
+            let pid = spawn_daemon(paths)?;
+            wait_for_daemon_ready(paths, Some(pid), Duration::from_secs(5)).await?;
+            println!("daemon restarted: pid={pid}");
+            println!("socket: {}", paths.socket_path.display());
+            println!("log:    {}", paths.daemon_log_path.display());
+        }
+        DaemonCommand::Status => {
+            let mut client = Client::connect(&paths.socket_path, "cm-cli", user_id)
+                .await
+                .with_context(|| "daemon is not running")?;
+            let resp = client
+                .request(Request::Diagnostics(DiagnosticsRequest::Status))
+                .await?;
+            print_response(as_json, &resp)?;
+        }
+    }
+    Ok(())
+}
+
+fn daemon_bin_path() -> PathBuf {
+    std::env::var("COGNITIVE_MEMORY_DAEMON_BIN")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            std::env::current_exe().map(|exe| {
+                exe.parent()
+                    .map(|d| d.join("cm-daemon"))
+                    .unwrap_or_else(|| PathBuf::from("cm-daemon"))
+            })
+        })
+        .unwrap_or_else(|_| PathBuf::from("cm-daemon"))
 }
 
 // ===========================================================================
@@ -798,10 +973,7 @@ fn default_socket_path() -> PathBuf {
 
 /// Where downloaded models live. Honours XDG via `dirs::cache_dir`.
 fn model_cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .expect("cache dir resolvable")
-        .join("cognitive-memory")
-        .join("models")
+    RuntimePaths::resolve().model_cache_dir
 }
 
 /// Registry of named models the CLI knows how to download. Adding a
@@ -944,62 +1116,194 @@ fn format_uptime(secs: u64) -> String {
     parts.join(" ")
 }
 
-async fn connect_or_spawn(socket: &Path, user_id: &str, auto_spawn: bool) -> Result<Client> {
-    match Client::connect(socket, "cm-cli", user_id).await {
+async fn connect_or_spawn(paths: &RuntimePaths, user_id: &str, auto_spawn: bool) -> Result<Client> {
+    match Client::connect(&paths.socket_path, "cm-cli", user_id).await {
         Ok(client) => return Ok(client),
         Err(e) if !auto_spawn => return Err(e.into()),
         Err(_) => {}
     }
-    spawn_daemon(socket)?;
-    wait_for_socket(socket, Duration::from_secs(2)).await?;
-    Client::connect(socket, "cm-cli", user_id)
+    recover_broken_daemon(paths).await?;
+    let child_pid = spawn_daemon(paths)?;
+    wait_for_daemon_ready(paths, Some(child_pid), Duration::from_secs(5)).await?;
+    Client::connect(&paths.socket_path, "cm-cli", user_id)
         .await
         .map_err(Into::into)
 }
 
-fn spawn_daemon(socket: &Path) -> Result<()> {
-    use std::process::{Command, Stdio};
+fn spawn_daemon(paths: &RuntimePaths) -> Result<u32> {
+    use std::process::Command;
 
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)?;
+    paths.ensure_private_dirs()?;
+    if let Some(parent) = paths.socket_path.parent() {
+        cognitive_memory_core::ensure_private_dir(parent)?;
     }
 
-    let bin = std::env::var("COGNITIVE_MEMORY_DAEMON_BIN")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            std::env::current_exe().map(|exe| {
-                exe.parent()
-                    .map(|d| d.join("cm-daemon"))
-                    .unwrap_or_else(|| PathBuf::from("cm-daemon"))
-            })
-        })
-        .unwrap_or_else(|_| PathBuf::from("cm-daemon"));
+    let bin = daemon_bin_path();
 
-    Command::new(&bin)
-        .env("COGNITIVE_MEMORY_SOCKET_PATH", socket)
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--foreground")
+        .env("COGNITIVE_MEMORY_INSTANCE", &paths.instance)
+        .env("COGNITIVE_MEMORY_SOCKET_PATH", &paths.socket_path)
+        .env("COGNITIVE_MEMORY_DB_PATH", &paths.db_path)
+        .env("COGNITIVE_MEMORY_PID_PATH", &paths.pid_path)
+        .env("COGNITIVE_MEMORY_LOG_PATH", &paths.daemon_log_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {}", bin.display()))?;
 
-    Ok(())
+    Ok(child.id())
 }
 
-async fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<()> {
+async fn wait_for_daemon_exit(paths: &RuntimePaths, timeout: Duration) -> Result<()> {
     let start = Instant::now();
-    let poll_interval = Duration::from_millis(20);
     loop {
-        if socket.exists() && tokio::net::UnixStream::connect(socket).await.is_ok() {
+        let socket_gone = !paths.socket_path.exists()
+            || tokio::net::UnixStream::connect(&paths.socket_path)
+                .await
+                .is_err();
+        let pid_dead = read_pid_file(&paths.pid_path)?
+            .map(|pid| !process_is_alive(pid))
+            .unwrap_or(true);
+        if socket_gone && pid_dead {
             return Ok(());
         }
         if start.elapsed() >= timeout {
             return Err(anyhow!(
-                "daemon did not bind {} within {}s",
-                socket.display(),
-                timeout.as_secs()
+                "daemon did not exit within {}s; pid: {}, socket: {}",
+                timeout.as_secs(),
+                paths.pid_path.display(),
+                paths.socket_path.display()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_daemon_ready(
+    paths: &RuntimePaths,
+    expected_pid: Option<u32>,
+    timeout: Duration,
+) -> Result<()> {
+    let start = Instant::now();
+    let poll_interval = Duration::from_millis(50);
+    loop {
+        if let Ok(mut client) =
+            Client::connect(&paths.socket_path, "cm-cli-startup", "default").await
+        {
+            if let Ok(resp) = client
+                .request_with_timeout(
+                    Request::Diagnostics(DiagnosticsRequest::Status),
+                    Duration::from_secs(2),
+                )
+                .await
+            {
+                if let Some(ResponseData::Status(status)) = resp.data {
+                    if expected_pid.is_none_or(|pid| status.daemon_pid == pid) {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Err(anyhow!(
+                "daemon did not become ready at {} within {}s; log: {}",
+                paths.socket_path.display(),
+                timeout.as_secs(),
+                paths.daemon_log_path.display()
             ));
         }
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+async fn recover_broken_daemon(paths: &RuntimePaths) -> Result<()> {
+    if tokio::net::UnixStream::connect(&paths.socket_path)
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    let Some(pid) = read_pid_file(&paths.pid_path)? else {
+        let _ = std::fs::remove_file(&paths.socket_path);
+        return Ok(());
+    };
+    if !process_is_alive(pid) {
+        let _ = std::fs::remove_file(&paths.pid_path);
+        let _ = std::fs::remove_file(&paths.socket_path);
+        return Ok(());
+    }
+
+    terminate_process(pid)?;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        if !process_is_alive(pid) {
+            let _ = std::fs::remove_file(&paths.pid_path);
+            let _ = std::fs::remove_file(&paths.socket_path);
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    kill_process(pid)?;
+    let _ = std::fs::remove_file(&paths.pid_path);
+    let _ = std::fs::remove_file(&paths.socket_path);
+    Ok(())
+}
+
+fn read_pid_file(path: &Path) -> Result<Option<u32>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let pid = text
+                .trim()
+                .parse::<u32>()
+                .with_context(|| format!("parse pid file {}", path.display()))?;
+            Ok(Some(pid))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read pid file {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    nix::sys::signal::kill(pid, None).is_ok()
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) -> Result<()> {
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate_process(_pid: u32) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32) -> Result<()> {
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn kill_process(_pid: u32) -> Result<()> {
+    Ok(())
 }

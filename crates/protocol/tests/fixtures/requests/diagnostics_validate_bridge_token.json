@@ -1,0 +1,12 @@
+{
+  "id": 23,
+  "payload": {
+    "kind": "Request",
+    "body": {
+      "bucket": "Diagnostics",
+      "op": "ValidateBridgeToken",
+      "token": "cmb_example",
+      "required_scope": "write"
+    }
+  }
+}

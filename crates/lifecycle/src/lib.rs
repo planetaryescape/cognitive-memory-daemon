@@ -98,7 +98,7 @@ impl Default for LifecycleConfig {
 fn default_base_decay_rates() -> HashMap<String, f64> {
     let mut m = HashMap::with_capacity(4);
     m.insert("episodic".to_string(), 45.0);
-    m.insert("semantic".to_string(), 240.0);  // v0.5: tuned from paper's 120
+    m.insert("semantic".to_string(), 240.0); // v0.5: tuned from paper's 120
     m.insert("core".to_string(), 120.0);
     m.insert("procedural".to_string(), f64::INFINITY);
     m

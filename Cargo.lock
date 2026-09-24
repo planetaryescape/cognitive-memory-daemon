@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "cognitive-memory-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -606,6 +606,7 @@ dependencies = [
  "cognitive-memory-protocol",
  "cognitive-memory-store",
  "dirs",
+ "nix",
  "predicates",
  "reqwest",
  "serde_json",
@@ -616,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "cognitive-memory-client"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "cognitive-memory-core",
@@ -631,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "cognitive-memory-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "chrono",
  "dirs",
@@ -644,11 +645,12 @@ dependencies = [
 
 [[package]]
 name = "cognitive-memory-daemon"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "clap",
  "cognitive-memory-client",
  "cognitive-memory-core",
  "cognitive-memory-embeddings",
@@ -659,6 +661,7 @@ dependencies = [
  "cognitive-memory-store",
  "dirs",
  "futures",
+ "nix",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -670,13 +673,15 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "ulid",
+ "uuid",
 ]
 
 [[package]]
 name = "cognitive-memory-embeddings"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "cognitive-memory-core",
@@ -693,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "cognitive-memory-graph"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "cognitive-memory-core",
  "pretty_assertions",
@@ -701,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "cognitive-memory-http-bridge"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -729,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "cognitive-memory-lifecycle"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "chrono",
  "cognitive-memory-core",
@@ -740,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "cognitive-memory-llm"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "cognitive-memory-core",
@@ -758,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "cognitive-memory-protocol"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "cognitive-memory-core",
@@ -773,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "cognitive-memory-search"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "chrono",
  "cognitive-memory-core",
@@ -789,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "cognitive-memory-store"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "chrono",
  "cognitive-memory-core",
@@ -955,6 +960,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1075,6 +1089,15 @@ dependencies = [
  "const-oid",
  "pem-rfc7468",
  "zeroize",
+]
+
+[[package]]
+name = "deranged"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+dependencies = [
+ "powerfmt",
 ]
 
 [[package]]
@@ -2435,6 +2458,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "no_std_io2"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2517,6 +2552,12 @@ checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
 dependencies = [
  "num-traits",
 ]
+
+[[package]]
+name = "num-conv"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "num-derive"
@@ -2858,6 +2899,12 @@ checksum = "0103b1cef7ec0cf76490e969665504990193874ea05c85ff9bab8b911d0a0564"
 dependencies = [
  "zerovec",
 ]
+
+[[package]]
+name = "powerfmt"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "ppv-lite86"
@@ -3946,6 +3993,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
+
+[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4068,6 +4121,37 @@ dependencies = [
  "quick-error 2.0.1",
  "weezl",
  "zune-jpeg",
+]
+
+[[package]]
+name = "time"
+version = "0.3.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
+dependencies = [
+ "deranged",
+ "itoa",
+ "num-conv",
+ "powerfmt",
+ "serde_core",
+ "time-core",
+ "time-macros",
+]
+
+[[package]]
+name = "time-core"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
+
+[[package]]
+name = "time-macros"
+version = "0.2.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
+dependencies = [
+ "num-conv",
+ "time-core",
 ]
 
 [[package]]
@@ -4311,6 +4395,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-appender"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
+dependencies = [
+ "crossbeam-channel",
+ "symlink",
+ "thiserror",
+ "time",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tracing-attributes"
 version = "0.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4518,7 +4615,9 @@ version = "1.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
+ "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

@@ -9,6 +9,9 @@ use cognitive_memory_embeddings::FakeEmbeddingProvider;
 use cognitive_memory_http_bridge::{
     enforce_loopback, router, AppState, BridgeError, Scope, TokenStore,
 };
+use cognitive_memory_protocol::{
+    BridgeScope, DiagnosticsRequest, MintBridgeTokenArgs, Request, ResponseData,
+};
 use cognitive_memory_store::Store;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -105,6 +108,8 @@ async fn boot_daemon_and_bridge() -> (
     let state = AppState {
         socket_path: socket_path.clone(),
         tokens,
+        allowed_hosts: Vec::new(),
+        allowed_origins: Vec::new(),
     };
     let app = router(state);
 
@@ -170,6 +175,62 @@ async fn http_post_memory_store_then_search_round_trip() {
         !results.as_array().unwrap().is_empty(),
         "search returned no results: {search_body}"
     );
+
+    let _ = shutdown.send(());
+    let _ = daemon_h.await;
+    bridge_h.abort();
+}
+
+#[tokio::test]
+async fn daemon_minted_token_authorizes_bridge_request() {
+    let (daemon_h, bridge_h, socket, addr, _local_token, shutdown, _tmp) =
+        boot_daemon_and_bridge().await;
+    let mut daemon_client = cognitive_memory_client::Client::connect(&socket, "test", "alice")
+        .await
+        .unwrap();
+    let minted = daemon_client
+        .request(Request::Diagnostics(DiagnosticsRequest::MintBridgeToken(
+            MintBridgeTokenArgs {
+                user_id: "alice".to_string(),
+                scope: BridgeScope::Write,
+                ttl_seconds: 3600,
+            },
+        )))
+        .await
+        .unwrap();
+    let token = match minted.data.expect("token") {
+        ResponseData::BridgeToken(t) => t.token,
+        other => panic!("expected BridgeToken, got {other:?}"),
+    };
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/memory/store"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "content": "Daemon token works through bridge."
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let _ = shutdown.send(());
+    let _ = daemon_h.await;
+    bridge_h.abort();
+}
+
+#[tokio::test]
+async fn bridge_rejects_disallowed_host_header() {
+    let (daemon_h, bridge_h, _socket, addr, token, shutdown, _tmp) = boot_daemon_and_bridge().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/memory/search"))
+        .header("Host", "evil.example")
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"query":"x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
 
     let _ = shutdown.send(());
     let _ = daemon_h.await;

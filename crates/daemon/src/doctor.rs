@@ -1,9 +1,9 @@
-//! `cm doctor` battery: a list of named checks each returning ok/warn/error
-//! plus a message. The aggregate report's exit code is derived from the
-//! worst result.
+//! Operator doctor battery: named checks returning ok/warn/error plus a
+//! message. Exposed through `Diagnostics::Doctor` and the `cm doctor` CLI.
 
 use cognitive_memory_store::Store;
 use std::path::Path;
+use tokio::net::UnixStream;
 
 /// Result level of a single doctor check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,26 +66,69 @@ impl DoctorReport {
     }
 }
 
-/// Run the doctor battery against a live store. Phase 11 ships the four
-/// most useful checks; provider checks (LLM/embedding reachability) and
-/// time-skew vs NTP land when those subsystems are configured.
-pub async fn run_doctor(socket_path: &Path, store: &Store) -> DoctorReport {
+/// Run the doctor battery against a live store. Provider checks
+/// (LLM/embedding reachability) and time-skew checks can be added when
+/// the operator-facing command is exposed.
+pub async fn run_doctor(
+    socket_path: &Path,
+    pid_path: &Path,
+    db_path: &Path,
+    log_path: &Path,
+    store: &Store,
+) -> DoctorReport {
     let mut checks = Vec::new();
 
-    // 1. Socket file exists and is reachable.
-    if socket_path.exists() {
-        checks.push(CheckResult::ok(
+    match UnixStream::connect(socket_path).await {
+        Ok(_) => checks.push(CheckResult::ok(
             "socket reachable",
             format!("{}", socket_path.display()),
-        ));
-    } else {
-        checks.push(CheckResult::error(
+        )),
+        Err(e) if socket_path.exists() => checks.push(CheckResult::error(
+            "socket reachable",
+            format!("socket exists but connect failed: {e}"),
+        )),
+        Err(_) => checks.push(CheckResult::error(
             "socket reachable",
             format!("not found: {}", socket_path.display()),
+        )),
+    }
+
+    match std::fs::read_to_string(pid_path) {
+        Ok(pid) => checks.push(CheckResult::ok(
+            "pid file",
+            format!("{} -> {}", pid_path.display(), pid.trim()),
+        )),
+        Err(e) => checks.push(CheckResult::error(
+            "pid file",
+            format!("{}: {e}", pid_path.display()),
+        )),
+    }
+
+    if db_path.exists() {
+        checks.push(CheckResult::ok(
+            "database file",
+            format!("{}", db_path.display()),
+        ));
+    } else {
+        checks.push(CheckResult::warn(
+            "database file",
+            format!("not found yet: {}", db_path.display()),
         ));
     }
 
-    // 2. Database writable: round-trip a known query.
+    if log_path.exists() {
+        checks.push(CheckResult::ok(
+            "log file",
+            format!("{}", log_path.display()),
+        ));
+    } else {
+        checks.push(CheckResult::warn(
+            "log file",
+            format!("not found yet: {}", log_path.display()),
+        ));
+    }
+
+    // Database queryable: round-trip a known query.
     match sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM schema_migrations")
         .fetch_one(store.reader())
         .await
@@ -100,7 +143,7 @@ pub async fn run_doctor(socket_path: &Path, store: &Store) -> DoctorReport {
         )),
     }
 
-    // 3. Memory count (warn if zero, since fresh-install).
+    // Memory count (warn if zero, since fresh-install).
     match sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM memories")
         .fetch_one(store.reader())
         .await
@@ -132,21 +175,17 @@ mod tests {
         use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("cm.sock");
-        // Touch the file so the existence check passes — this is a unit
-        // test of the doctor logic, not of the real socket.
-        std::fs::File::create(&socket)
-            .unwrap()
-            .write_all(b"")
-            .unwrap();
+        let pid = tmp.path().join("cm-daemon.pid");
+        let db = tmp.path().join("data.db");
+        let log = tmp.path().join("daemon.log");
+        std::fs::write(&pid, "123\n").unwrap();
+        std::fs::File::create(&db).unwrap().write_all(b"").unwrap();
+        std::fs::File::create(&log).unwrap().write_all(b"").unwrap();
 
         let store = Store::in_memory().await.unwrap();
-        let report = run_doctor(&socket, &store).await;
+        let report = run_doctor(&socket, &pid, &db, &log, &store).await;
 
-        assert_eq!(report.exit_code(), 1, "empty store should warn");
-        assert!(report
-            .checks
-            .iter()
-            .any(|c| c.name == "socket reachable" && c.level == CheckLevel::Ok));
+        assert_eq!(report.exit_code(), 2, "missing socket should error");
         assert!(report
             .checks
             .iter()
@@ -157,8 +196,11 @@ mod tests {
     async fn doctor_errors_when_socket_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("never_existed.sock");
+        let pid = tmp.path().join("cm-daemon.pid");
+        let db = tmp.path().join("data.db");
+        let log = tmp.path().join("daemon.log");
         let store = Store::in_memory().await.unwrap();
-        let report = run_doctor(&socket, &store).await;
+        let report = run_doctor(&socket, &pid, &db, &log, &store).await;
         assert_eq!(report.exit_code(), 2);
         assert!(report
             .checks

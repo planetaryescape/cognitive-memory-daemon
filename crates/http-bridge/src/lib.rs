@@ -3,14 +3,12 @@
 //! Loopback-only HTTP/JSON proxy to the daemon's Unix socket. Per
 //! ADR 0005, refuses to bind any non-loopback address. Per `SECURITY.md`
 //! §2 T5, every request requires `Authorization: Bearer <token>`. Tokens
-//! are minted by the daemon (via `Diagnostics::MintBridgeToken` once that
-//! request kind ships) and stored hashed.
+//! can be minted by the daemon via `Diagnostics::MintBridgeToken`; the
+//! bridge stores only salted hashes in its in-memory token map.
 //!
-//! Phase 12 v1: socket binding refusal logic, bearer-token validation
-//! against an in-memory token map (with hashed-at-rest discipline), and
-//! POST routes for `/memory/store` and `/memory/search`. Live token mint
-//! via `Diagnostics::MintBridgeToken` lands when the daemon protocol
-//! grows that request kind.
+//! Current v1 surface: socket binding refusal logic, bearer-token
+//! validation against an in-memory token map, and POST routes for
+//! `/memory/store` and `/memory/search`.
 
 // `result_large_err`: BridgeError carries a SocketAddr; that's the right
 // shape for the error and boxing it would obscure the API for callers.
@@ -20,22 +18,27 @@
 
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE, HOST},
+        HeaderMap, HeaderValue, Method, StatusCode,
+    },
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
 use cognitive_memory_client::Client;
 use cognitive_memory_protocol::{
-    MemoryRequest, Request, Response as DaemonResponse, SearchMemoryArgs, StoreMemoryArgs,
+    BridgeScope, DiagnosticsRequest, MemoryRequest, Request, Response as DaemonResponse,
+    ResponseData, SearchMemoryArgs, StoreMemoryArgs, ValidateBridgeTokenArgs,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use subtle::ConstantTimeEq;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::warn;
 
 /// Errors surfaced by the bridge during setup.
@@ -139,15 +142,26 @@ impl TokenStore {
 pub struct AppState {
     pub socket_path: PathBuf,
     pub tokens: TokenStore,
+    pub allowed_hosts: Vec<String>,
+    pub allowed_origins: Vec<HeaderValue>,
 }
 
 /// Build the axum router with the routes Phase 12 ships. Add new routes
 /// here as the daemon protocol grows.
 pub fn router(state: AppState) -> Router {
+    let allowed_origins = state.allowed_origins.clone();
+    let cors = CorsLayer::new()
+        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            allowed_origins.iter().any(|allowed| allowed == origin)
+        }));
+
     Router::new()
         .route("/memory/store", post(memory_store))
         .route("/memory/search", post(memory_search))
         .with_state(std::sync::Arc::new(state))
+        .layer(cors)
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,7 +210,7 @@ async fn memory_store(
     headers: HeaderMap,
     Json(body): Json<StoreBody>,
 ) -> Response {
-    let (user_id, _scope) = match check_auth(&state.tokens, &headers, Scope::Write) {
+    let (user_id, _scope) = match authenticate(&state, &headers, Scope::Write).await {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -222,7 +236,7 @@ async fn memory_search(
     headers: HeaderMap,
     Json(body): Json<SearchBody>,
 ) -> Response {
-    let (user_id, _scope) = match check_auth(&state.tokens, &headers, Scope::Read) {
+    let (user_id, _scope) = match authenticate(&state, &headers, Scope::Read).await {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -244,11 +258,12 @@ async fn memory_search(
     daemon_call(&mut client, req).await
 }
 
-fn check_auth(
-    tokens: &TokenStore,
+async fn authenticate(
+    state: &AppState,
     headers: &HeaderMap,
     required_scope: Scope,
 ) -> Result<(String, Scope), Response> {
+    check_host(headers, &state.allowed_hosts)?;
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -257,13 +272,79 @@ fn check_auth(
         .strip_prefix("Bearer ")
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "expected Bearer token"))?;
 
-    match tokens.validate(token.as_bytes()) {
+    match state.tokens.validate(token.as_bytes()) {
         Some((uid, scope)) if scope.allows(required_scope) => Ok((uid, scope)),
         Some(_) => Err(error(StatusCode::FORBIDDEN, "token scope insufficient")),
-        None => {
-            warn!("rejected unknown bearer token");
-            Err(error(StatusCode::UNAUTHORIZED, "invalid token"))
-        }
+        None => validate_daemon_token(&state.socket_path, token, required_scope).await,
+    }
+}
+
+fn check_host(headers: &HeaderMap, allowed_hosts: &[String]) -> Result<(), Response> {
+    let host = headers
+        .get(HOST)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "missing Host header"))?;
+    if is_default_loopback_host(host) || allowed_hosts.iter().any(|allowed| allowed == host) {
+        Ok(())
+    } else {
+        warn!(host, "rejected Host header");
+        Err(error(StatusCode::FORBIDDEN, "Host header not allowed"))
+    }
+}
+
+fn is_default_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host.starts_with("localhost:")
+        || host == "127.0.0.1"
+        || host.starts_with("127.0.0.1:")
+        || host == "[::1]"
+        || host.starts_with("[::1]:")
+}
+
+async fn validate_daemon_token(
+    socket_path: &Path,
+    token: &str,
+    required_scope: Scope,
+) -> Result<(String, Scope), Response> {
+    let mut client = Client::connect(socket_path, "cm-http-auth", "default")
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("connect: {e}")))?;
+    let required_scope = bridge_scope(required_scope);
+    let resp = client
+        .request(Request::Diagnostics(
+            DiagnosticsRequest::ValidateBridgeToken(ValidateBridgeTokenArgs {
+                token: token.to_string(),
+                required_scope,
+            }),
+        ))
+        .await
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("daemon: {e}")))?;
+    if !resp.ok {
+        warn!("rejected unknown bearer token");
+        return Err(error(StatusCode::UNAUTHORIZED, "invalid token"));
+    }
+    match resp.data {
+        Some(ResponseData::BridgeTokenValidated(v)) => Ok((v.user_id, scope_from_bridge(v.scope))),
+        other => Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected daemon token response: {other:?}"),
+        )),
+    }
+}
+
+fn bridge_scope(scope: Scope) -> BridgeScope {
+    match scope {
+        Scope::Read => BridgeScope::Read,
+        Scope::Write => BridgeScope::Write,
+        Scope::Admin => BridgeScope::Admin,
+    }
+}
+
+fn scope_from_bridge(scope: BridgeScope) -> Scope {
+    match scope {
+        BridgeScope::Read => Scope::Read,
+        BridgeScope::Write => Scope::Write,
+        BridgeScope::Admin => Scope::Admin,
     }
 }
 

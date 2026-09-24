@@ -10,21 +10,53 @@
 
 #![allow(clippy::panic, clippy::unwrap_used)]
 
+use bytes::BytesMut;
 use cognitive_memory_client::Client;
 use cognitive_memory_daemon::Daemon;
 use cognitive_memory_embeddings::FakeEmbeddingProvider;
+use cognitive_memory_llm::{ExtractedMemory, ExtractionRequest, LlmError, LlmProvider};
 use cognitive_memory_protocol::{
     BatchMemoryEntry, BridgeScope, ClearArgs, CountsArgs, DeleteMemoryArgs, DiagnosticsRequest,
-    GetLinkedArgs, GetMemoryArgs, LifecycleRequest, LinkMemoryArgs, ListMemoryArgs, MemoryRequest,
-    MintBridgeTokenArgs, Request, ResponseData, SearchMemoryArgs, StoreBatchArgs, StoreMemoryArgs,
-    TickArgs, UpdateMemoryArgs, UpdateRetentionArgs,
+    Event, GetLinkedArgs, GetMemoryArgs, IpcCodec, IpcMessage, IpcPayload, LifecycleRequest,
+    LinkMemoryArgs, ListMemoryArgs, MemoryRequest, MintBridgeTokenArgs, RecentTracesArgs, Request,
+    ResponseData, SearchMemoryArgs, StoreBatchArgs, StoreMemoryArgs, SubscribeArgs, TickArgs,
+    UpdateMemoryArgs, UpdateRetentionArgs, ValidateBridgeTokenArgs, IPC_PROTOCOL_VERSION,
 };
 use cognitive_memory_store::Store;
+use futures::{SinkExt, StreamExt};
 use pretty_assertions::assert_eq;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
+
+struct DelayedLlmProvider {
+    started: Arc<tokio::sync::Notify>,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for DelayedLlmProvider {
+    fn name(&self) -> &str {
+        "fake"
+    }
+
+    fn model(&self) -> &str {
+        "delayed"
+    }
+
+    async fn extract(&self, _req: ExtractionRequest<'_>) -> Result<Vec<ExtractedMemory>, LlmError> {
+        Ok(Vec::new())
+    }
+
+    async fn complete(&self, _prompt: &str, _max_tokens: usize) -> Result<String, LlmError> {
+        self.started.notify_waiters();
+        tokio::time::sleep(self.delay).await;
+        Ok("NONE".to_string())
+    }
+}
 
 /// Boot a daemon backed by an on-disk SQLite + a fake embedding provider,
 /// returning the running task handle, the socket path, and a shutdown sender.
@@ -134,7 +166,6 @@ async fn boot_daemon_serve(
     TempDir,
     Arc<FakeEmbeddingProvider>,
 ) {
-
     let handle = tokio::spawn(async move {
         daemon.serve().await.expect("daemon serve");
     });
@@ -146,6 +177,36 @@ async fn boot_daemon_serve(
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("daemon never bound the socket");
+}
+
+async fn write_length_prefixed_json(
+    stream: &mut tokio::net::UnixStream,
+    value: &serde_json::Value,
+) {
+    let bytes = serde_json::to_vec(value).unwrap();
+    let mut codec = LengthDelimitedCodec::builder()
+        .length_field_length(4)
+        .max_frame_length(16 * 1024 * 1024)
+        .new_codec();
+    let mut buf = BytesMut::new();
+    codec.encode(bytes::Bytes::from(bytes), &mut buf).unwrap();
+    stream.write_all(&buf).await.unwrap();
+    stream.flush().await.unwrap();
+}
+
+async fn read_length_prefixed_json(stream: &mut tokio::net::UnixStream) -> serde_json::Value {
+    let mut buf = BytesMut::with_capacity(8 * 1024);
+    let mut codec = LengthDelimitedCodec::builder()
+        .length_field_length(4)
+        .max_frame_length(16 * 1024 * 1024)
+        .new_codec();
+    loop {
+        if let Some(frame) = codec.decode(&mut buf).unwrap() {
+            return serde_json::from_slice(&frame).unwrap();
+        }
+        let n = stream.read_buf(&mut buf).await.unwrap();
+        assert!(n > 0, "daemon closed during handshake");
+    }
 }
 
 #[tokio::test]
@@ -166,9 +227,256 @@ async fn diagnostics_status_returns_zero_memory_count_on_fresh_store() {
         ResponseData::Status(status) => {
             assert_eq!(status.memory_count, 0);
             assert_eq!(status.daemon_version, env!("CARGO_PKG_VERSION"));
+            assert_eq!(
+                status.protocol_version,
+                cognitive_memory_protocol::IPC_PROTOCOL_VERSION
+            );
+            assert!(status.daemon_pid > 0);
+            assert!(status.socket_path.ends_with("cm.sock"));
+            assert!(status.pid_path.ends_with("cm-daemon.pid"));
+            assert!(status.db_path.ends_with("data.db"));
+            assert!(status.build_id.contains(env!("CARGO_PKG_VERSION")));
         }
         other => panic!("expected Status, got {other:?}"),
     }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn diagnostics_doctor_and_trace_are_exposed_over_ipc() {
+    let (handle, socket, shutdown, _tmp) = boot_daemon().await;
+    let mut client = Client::connect(&socket, "test-client", "alice")
+        .await
+        .unwrap();
+
+    let doctor = client
+        .request(Request::Diagnostics(DiagnosticsRequest::Doctor))
+        .await
+        .unwrap();
+    assert!(doctor.ok, "doctor failed: {:?}", doctor.error);
+    match doctor.data.expect("doctor data") {
+        ResponseData::Doctor(report) => {
+            assert!(
+                report.checks.iter().any(|c| c.name == "socket reachable"),
+                "doctor should include socket reachability"
+            );
+            assert!(
+                report.checks.iter().any(|c| c.name == "pid file"),
+                "doctor should include pid file"
+            );
+        }
+        other => panic!("expected Doctor, got {other:?}"),
+    }
+
+    let traces = client
+        .request(Request::Diagnostics(DiagnosticsRequest::RecentTraces(
+            RecentTracesArgs { limit: 5 },
+        )))
+        .await
+        .unwrap();
+    assert!(traces.ok, "trace failed: {:?}", traces.error);
+    match traces.data.expect("trace data") {
+        ResponseData::RecentTraces(data) => {
+            assert!(
+                data.traces
+                    .iter()
+                    .any(|trace| trace.bucket == "Diagnostics" && trace.op == "Doctor"),
+                "recent traces should include the doctor request"
+            );
+        }
+        other => panic!("expected RecentTraces, got {other:?}"),
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn second_daemon_refuses_reachable_socket_without_removing_it() {
+    let (handle, socket, shutdown, tmp) = boot_daemon().await;
+    let second_store = Store::open(&tmp.path().join("second.db")).await.unwrap();
+    let second_embeddings = Arc::new(FakeEmbeddingProvider::new("local", "fake-16", 16));
+    let second = Daemon::new(second_store, second_embeddings, socket.clone());
+
+    let err = second
+        .serve()
+        .await
+        .expect_err("second daemon must refuse live socket");
+    assert!(
+        matches!(err, cognitive_memory_daemon::DaemonError::AlreadyRunning(_)),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        socket.exists(),
+        "live socket must not be removed by refused daemon"
+    );
+    assert!(
+        Client::connect(&socket, "test-client", "alice")
+            .await
+            .is_ok(),
+        "original daemon should still accept connections"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn daemon_secures_socket_pid_and_database_files() {
+    let (handle, socket, shutdown, tmp) = boot_daemon().await;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let socket_mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+        let pid_mode = std::fs::metadata(tmp.path().join("cm-daemon.pid"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let db_mode = std::fs::metadata(tmp.path().join("data.db"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(socket_mode, 0o700);
+        assert_eq!(pid_mode, 0o600);
+        assert_eq!(db_mode, 0o600);
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn subscribe_replays_current_state_event_on_same_connection() {
+    let (handle, socket, shutdown, _tmp) = boot_daemon().await;
+    let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    write_length_prefixed_json(
+        &mut stream,
+        &serde_json::json!({
+            "kind": "Hello",
+            "client": "event-test",
+            "protocol_version": IPC_PROTOCOL_VERSION,
+            "user_id": "alice"
+        }),
+    )
+    .await;
+    let welcome = read_length_prefixed_json(&mut stream).await;
+    assert_eq!(welcome["kind"], "Welcome");
+
+    let mut framed = Framed::new(stream, IpcCodec::new());
+    framed
+        .send(IpcMessage {
+            id: 1,
+            payload: IpcPayload::Request(Request::Memory(MemoryRequest::Subscribe(
+                SubscribeArgs {
+                    replay_snapshot: true,
+                },
+            ))),
+        })
+        .await
+        .unwrap();
+
+    let response = framed.next().await.unwrap().unwrap();
+    assert_eq!(response.id, 1);
+    assert!(matches!(
+        response.payload,
+        IpcPayload::Response(cognitive_memory_protocol::Response {
+            data: Some(ResponseData::Subscribed(_)),
+            ..
+        })
+    ));
+
+    let event = framed.next().await.unwrap().unwrap();
+    assert_eq!(event.id, 0);
+    assert!(matches!(
+        event.payload,
+        IpcPayload::Event(Event::CurrentState {
+            memory_count: 0,
+            ..
+        })
+    ));
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn same_connection_hot_status_is_not_blocked_by_bulk_tick() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let llm = Arc::new(DelayedLlmProvider {
+        started: started.clone(),
+        delay: Duration::from_millis(400),
+    }) as Arc<dyn cognitive_memory_llm::LlmProvider>;
+    let (handle, socket, shutdown, _tmp, embeddings) = boot_daemon_with_llm(llm).await;
+
+    let mut setup_client = Client::connect(&socket, "setup-client", "alice")
+        .await
+        .unwrap();
+    let _ = setup_conflict_pair(
+        &mut setup_client,
+        &embeddings,
+        "user prefers morning planning",
+        "user prefers evening planning",
+    )
+    .await;
+    drop(setup_client);
+
+    let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    write_length_prefixed_json(
+        &mut stream,
+        &serde_json::json!({
+            "kind": "Hello",
+            "client": "priority-test",
+            "protocol_version": IPC_PROTOCOL_VERSION,
+            "user_id": "alice"
+        }),
+    )
+    .await;
+    let welcome = read_length_prefixed_json(&mut stream).await;
+    assert_eq!(welcome["kind"], "Welcome");
+
+    let mut framed = Framed::new(stream, IpcCodec::new());
+    framed
+        .send(IpcMessage {
+            id: 1,
+            payload: IpcPayload::Request(Request::Lifecycle(LifecycleRequest::Tick(TickArgs {
+                synchronous: true,
+            }))),
+        })
+        .await
+        .unwrap();
+    framed
+        .send(IpcMessage {
+            id: 2,
+            payload: IpcPayload::Request(Request::Diagnostics(DiagnosticsRequest::Status)),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_millis(200), started.notified())
+        .await
+        .expect("tick should enter delayed LLM work");
+
+    let first = tokio::time::timeout(Duration::from_millis(200), framed.next())
+        .await
+        .expect("hot status should return while bulk tick is still running")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first.id, 2,
+        "same-connection hot request should not wait behind bulk tick"
+    );
+    assert!(matches!(
+        first.payload,
+        IpcPayload::Response(cognitive_memory_protocol::Response {
+            data: Some(ResponseData::Status(_)),
+            ..
+        })
+    ));
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -282,6 +590,28 @@ async fn mint_bridge_token_returns_token_and_persists_hash_in_kv() {
             .await
             .unwrap();
     assert_eq!(rows, 1, "exactly one token hash row must exist");
+
+    let validate = client
+        .request(Request::Diagnostics(
+            DiagnosticsRequest::ValidateBridgeToken(ValidateBridgeTokenArgs {
+                token,
+                required_scope: BridgeScope::Read,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        validate.ok,
+        "write token should satisfy read: {:?}",
+        validate.error
+    );
+    match validate.data.expect("validate data") {
+        ResponseData::BridgeTokenValidated(v) => {
+            assert_eq!(v.user_id, "alice");
+            assert_eq!(v.scope, BridgeScope::Write);
+        }
+        other => panic!("expected BridgeTokenValidated, got {other:?}"),
+    }
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -2674,11 +3004,7 @@ async fn stub_returns_retention_zero_regardless_of_age() {
 ///
 /// `age_days` controls how far back the access timestamp is set so the
 /// retention formula returns a value < 1.0 that's sensitive to β.
-async fn store_backdate_get_retention(
-    socket: &PathBuf,
-    db_path: &PathBuf,
-    age_days: i64,
-) -> f64 {
+async fn store_backdate_get_retention(socket: &Path, db_path: &Path, age_days: i64) -> f64 {
     let mut client = Client::connect(socket, "test-client", "alice")
         .await
         .unwrap();
@@ -2750,10 +3076,8 @@ async fn lifecycle_override_changes_current_retention_through_ipc() {
     let paper_cfg: LifecycleConfig = cognitive_memory_daemon::paper_faithful_lifecycle_config();
 
     // Boot both daemons. Each gets its own tempdir, socket, store.
-    let (h1, sock1, sh1, _tmp1, _emb1, db1) =
-        boot_daemon_with_lifecycle(paper_cfg).await;
-    let (h2, sock2, sh2, _tmp2, _emb2, db2) =
-        boot_daemon_with_lifecycle(fast_cfg).await;
+    let (h1, sock1, sh1, _tmp1, _emb1, db1) = boot_daemon_with_lifecycle(paper_cfg).await;
+    let (h2, sock2, sh2, _tmp2, _emb2, db2) = boot_daemon_with_lifecycle(fast_cfg).await;
 
     let r_paper = store_backdate_get_retention(&sock1, &db1, 90).await;
     let r_fast = store_backdate_get_retention(&sock2, &db2, 90).await;
@@ -2770,8 +3094,14 @@ async fn lifecycle_override_changes_current_retention_through_ipc() {
         "override didn't change retention: r_paper={r_paper}, r_fast={r_fast}"
     );
     // Sanity: both must still be in [0, 1] (no NaN, no above-floor weirdness).
-    assert!(r_paper > 0.0 && r_paper <= 1.0, "r_paper out of range: {r_paper}");
-    assert!(r_fast > 0.0 && r_fast <= 1.0, "r_fast out of range: {r_fast}");
+    assert!(
+        r_paper > 0.0 && r_paper <= 1.0,
+        "r_paper out of range: {r_paper}"
+    );
+    assert!(
+        r_fast > 0.0 && r_fast <= 1.0,
+        "r_fast out of range: {r_fast}"
+    );
 }
 
 #[tokio::test]

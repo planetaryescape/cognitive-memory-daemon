@@ -9,15 +9,18 @@ use cognitive_memory_lifecycle::{
     compute_retention, parse_category, stability_from_importance, LifecycleConfig, MemoryState,
 };
 use cognitive_memory_protocol::{
-    AffectedData, BatchUpdateArgs, BridgeTokenData, ClearArgs, ConvertToStubArgs, CountsArgs,
-    CountsData, DeleteManyMemoryArgs, DeleteMemoryArgs, DiagnosticsRequest, FindFadingArgs,
+    AffectedData, BatchUpdateArgs, BridgeScope, BridgeTokenData, BridgeTokenValidatedData,
+    ClearArgs, ConvertToStubArgs, CountsArgs, CountsData, DeleteManyMemoryArgs, DeleteMemoryArgs,
+    DiagnosticsRequest, DoctorCheckData, DoctorCheckLevel, DoctorData, FindFadingArgs,
     FindStableArgs, GetLinkedArgs, GetLinkedManyArgs, GetManyMemoryArgs, GetMemoryArgs,
     LexicalIdsData, LifecycleRequest, LinkMemoryArgs, LinkStrengthData, LinkedMemoriesData,
     LinkedMemoryData, ListMemoryArgs, MarkSupersededArgs, MemoriesData, MemoryData, MemoryRequest,
     MemorySearchResultsData, MemoryStoredBatchData, MemoryStoredData, MigrateToColdArgs,
-    MigrateToHotArgs, MintBridgeTokenArgs, Request, Response, ResponseData, SearchHit,
-    SearchLexicalArgs, SearchMemoryArgs, StatusData, StoreBatchArgs, StoreMemoryArgs, TickArgs,
-    TickResultData, UnlinkMemoryArgs, UpdateMemoryArgs, UpdateRetentionArgs, VectorSearchArgs,
+    MigrateToHotArgs, MintBridgeTokenArgs, RecentTracesArgs, RecentTracesData, Request, Response,
+    ResponseData, SearchHit, SearchLexicalArgs, SearchMemoryArgs, ShutdownData, StatusData,
+    StoreBatchArgs, StoreMemoryArgs, TickArgs, TickResultData, TraceData, UnlinkMemoryArgs,
+    UpdateMemoryArgs, UpdateRetentionArgs, ValidateBridgeTokenArgs, VectorSearchArgs,
+    IPC_PROTOCOL_VERSION,
 };
 use cognitive_memory_search::{ResultSource, SearchError, SearchOptions, Searcher};
 use cognitive_memory_store::{
@@ -25,7 +28,7 @@ use cognitive_memory_store::{
 };
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
-use tokio::sync::Semaphore;
+use tokio::sync::{broadcast, Semaphore};
 use tracing::{debug, instrument};
 
 const PROVIDER_NAME: &str = "local";
@@ -52,6 +55,7 @@ pub struct AppState {
     pub store: Store,
     pub embeddings: Arc<dyn EmbeddingProvider>,
     pub request_semaphore: Arc<Semaphore>,
+    pub bulk_semaphore: Arc<Semaphore>,
     /// Monotonic clock anchor set when `AppState` is constructed. Used
     /// to compute `StatusData::uptime_seconds`. Monotonic (not wall
     /// clock) so suspend/clock-skew don't produce negative or
@@ -71,6 +75,10 @@ pub struct AppState {
     /// overrides merged onto paper-faithful defaults. Used by
     /// `compute_current_retention` and consolidation/promotion paths.
     pub lifecycle: LifecycleConfig,
+    pub shutdown_tx: broadcast::Sender<()>,
+    pub event_tx: broadcast::Sender<cognitive_memory_protocol::Event>,
+    pub trace_ring: Arc<crate::trace::TraceRing>,
+    pub runtime: crate::server::DaemonRuntime,
 }
 
 #[instrument(skip(req, state), fields(user_id = %user_id))]
@@ -81,8 +89,16 @@ pub async fn handle_request(
 ) -> Result<Response, HandlerError> {
     match req {
         Request::Diagnostics(DiagnosticsRequest::Status) => handle_status(state).await,
+        Request::Diagnostics(DiagnosticsRequest::Doctor) => handle_doctor(state).await,
+        Request::Diagnostics(DiagnosticsRequest::RecentTraces(args)) => {
+            handle_recent_traces(args, state).await
+        }
+        Request::Diagnostics(DiagnosticsRequest::Shutdown) => handle_shutdown(state).await,
         Request::Diagnostics(DiagnosticsRequest::MintBridgeToken(args)) => {
             handle_mint_bridge_token(args, state).await
+        }
+        Request::Diagnostics(DiagnosticsRequest::ValidateBridgeToken(args)) => {
+            handle_validate_bridge_token(args, state).await
         }
         Request::Diagnostics(DiagnosticsRequest::Counts(args)) => {
             handle_counts(args, state, user_id).await
@@ -103,8 +119,81 @@ async fn handle_status(state: &Arc<AppState>) -> Result<Response, HandlerError> 
         .await?;
     Ok(Response::ok(ResponseData::Status(StatusData {
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_version: IPC_PROTOCOL_VERSION,
+        build_id: state.runtime.build_id.clone(),
+        instance: state.runtime.instance.clone(),
+        daemon_pid: std::process::id(),
+        socket_path: state.runtime.socket_path.display().to_string(),
+        pid_path: state.runtime.pid_path.display().to_string(),
+        db_path: state.runtime.db_path.display().to_string(),
+        log_path: state.runtime.log_path.display().to_string(),
         uptime_seconds: state.started_at.elapsed().as_secs(),
         memory_count: count.0 as u64,
+    })))
+}
+
+async fn handle_doctor(state: &Arc<AppState>) -> Result<Response, HandlerError> {
+    let report = crate::doctor::run_doctor(
+        &state.runtime.socket_path,
+        &state.runtime.pid_path,
+        &state.runtime.db_path,
+        &state.runtime.log_path,
+        &state.store,
+    )
+    .await;
+    let exit_code = report.exit_code();
+    let checks = report
+        .checks
+        .into_iter()
+        .map(|check| DoctorCheckData {
+            name: check.name.to_string(),
+            level: match check.level {
+                crate::doctor::CheckLevel::Ok => DoctorCheckLevel::Ok,
+                crate::doctor::CheckLevel::Warn => DoctorCheckLevel::Warn,
+                crate::doctor::CheckLevel::Error => DoctorCheckLevel::Error,
+            },
+            message: check.message,
+        })
+        .collect();
+    Ok(Response::ok(ResponseData::Doctor(DoctorData {
+        exit_code,
+        checks,
+    })))
+}
+
+async fn handle_recent_traces(
+    args: RecentTracesArgs,
+    state: &Arc<AppState>,
+) -> Result<Response, HandlerError> {
+    let traces = state
+        .trace_ring
+        .recent(args.limit)
+        .into_iter()
+        .map(|trace| TraceData {
+            trace_id: trace.trace_id,
+            request_id: trace.request_id,
+            bucket: trace.bucket.to_string(),
+            op: trace.op.to_string(),
+            embed_ms: trace.embed_ms,
+            vector_ms: trace.vector_ms,
+            fusion_ms: trace.fusion_ms,
+            format_ms: trace.format_ms,
+            elapsed_ms: trace.elapsed_ms,
+        })
+        .collect();
+    Ok(Response::ok(ResponseData::RecentTraces(RecentTracesData {
+        traces,
+    })))
+}
+
+async fn handle_shutdown(state: &Arc<AppState>) -> Result<Response, HandlerError> {
+    let tx = state.shutdown_tx.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        let _ = tx.send(());
+    });
+    Ok(Response::ok(ResponseData::Shutdown(ShutdownData {
+        accepted: true,
     })))
 }
 
@@ -131,7 +220,11 @@ async fn handle_mint_bridge_token(
 ) -> Result<Response, HandlerError> {
     use sha2::{Digest, Sha256};
 
-    let raw = format!("cmb_{}{}", ulid::Ulid::new(), ulid::Ulid::new());
+    let raw = format!(
+        "cmb_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
     let salt = "cm-daemon-bridge-token-salt";
     let mut hasher = Sha256::new();
     hasher.update(salt.as_bytes());
@@ -166,6 +259,74 @@ async fn handle_mint_bridge_token(
     })))
 }
 
+async fn handle_validate_bridge_token(
+    args: ValidateBridgeTokenArgs,
+    state: &Arc<AppState>,
+) -> Result<Response, HandlerError> {
+    use sha2::{Digest, Sha256};
+
+    let salt = "cm-daemon-bridge-token-salt";
+    let mut hasher = Sha256::new();
+    hasher.update(salt.as_bytes());
+    hasher.update(args.token.as_bytes());
+    let hash = hasher.finalize();
+    let hash_hex = hex_lower(&hash);
+
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM kv WHERE namespace = ? AND key = ?")
+            .bind("bridge_tokens")
+            .bind(hash_hex)
+            .fetch_optional(state.store.reader())
+            .await?;
+    let Some((value,)) = row else {
+        return Err(HandlerError::InvalidPayload("invalid bridge token".into()));
+    };
+    let value: serde_json::Value = serde_json::from_str(&value)
+        .map_err(|e| HandlerError::InvalidPayload(format!("malformed bridge token record: {e}")))?;
+    let user_id = value
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| HandlerError::InvalidPayload("bridge token missing user_id".into()))?
+        .to_string();
+    let scope = match value
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("read")
+    {
+        "admin" => BridgeScope::Admin,
+        "write" => BridgeScope::Write,
+        _ => BridgeScope::Read,
+    };
+    let expires_at_unix = value
+        .get("expires_at_unix")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if expires_at_unix <= unix_now() {
+        return Err(HandlerError::InvalidPayload("bridge token expired".into()));
+    }
+    if !bridge_scope_allows(scope, args.required_scope) {
+        return Err(HandlerError::InvalidPayload(
+            "bridge token scope insufficient".into(),
+        ));
+    }
+    Ok(Response::ok(ResponseData::BridgeTokenValidated(
+        BridgeTokenValidatedData {
+            user_id,
+            scope,
+            expires_at_unix,
+        },
+    )))
+}
+
+fn bridge_scope_allows(actual: BridgeScope, required: BridgeScope) -> bool {
+    matches!(
+        (actual, required),
+        (BridgeScope::Admin, _)
+            | (BridgeScope::Write, BridgeScope::Write | BridgeScope::Read)
+            | (BridgeScope::Read, BridgeScope::Read)
+    )
+}
+
 // =========================================================================
 // Memory
 // =========================================================================
@@ -176,6 +337,9 @@ async fn handle_memory_request(
     connection_user: &str,
 ) -> Result<Response, HandlerError> {
     match req {
+        MemoryRequest::Subscribe(_) => Err(HandlerError::InvalidPayload(
+            "Subscribe is connection-scoped and must be handled by the server".to_string(),
+        )),
         MemoryRequest::Store(args) => handle_memory_store(args, state, connection_user).await,
         MemoryRequest::StoreBatch(args) => {
             handle_memory_store_batch(args, state, connection_user).await
@@ -1100,6 +1264,14 @@ async fn handle_tick(_args: TickArgs, state: &Arc<AppState>) -> Result<Response,
         consolidated,
         "tick complete"
     );
+
+    let _ = state
+        .event_tx
+        .send(cognitive_memory_protocol::Event::TickCompleted {
+            memories_decayed: decayed,
+            consolidations_attempted: consolidated,
+            occurred_at: chrono::Utc::now().to_rfc3339(),
+        });
 
     Ok(Response::ok(ResponseData::Tick(TickResultData {
         completed: true,

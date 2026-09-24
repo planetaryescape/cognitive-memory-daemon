@@ -7,6 +7,14 @@
       "data": {
         "kind": "Status",
         "daemon_version": "0.0.1",
+        "protocol_version": 1,
+        "build_id": "0.0.1:/bin/cm-daemon:123:456",
+        "instance": "cognitive-memory-dev",
+        "daemon_pid": 12345,
+        "socket_path": "/tmp/cognitive-memory-dev/cm.sock",
+        "pid_path": "/tmp/cognitive-memory-dev/cm-daemon.pid",
+        "db_path": "/tmp/cognitive-memory-dev/data.db",
+        "log_path": "/tmp/cognitive-memory-dev/daemon.log",
         "uptime_seconds": 12345,
         "memory_count": 4321
       }

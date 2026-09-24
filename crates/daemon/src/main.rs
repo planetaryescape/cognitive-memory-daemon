@@ -6,12 +6,14 @@
 // to `FakeEmbeddingProvider` when the feature is off so CI builds the
 // daemon without pulling fastembed.
 //
-// Auto-spawn, PID-file single-instance, structured logging, and signal
-// handling beyond Ctrl-C land in subsequent phases (per docs/decisions/
-// and ROADMAP.md).
+// The CLI owns auto-spawn: it starts this binary with
+// `COGNITIVE_MEMORY_SOCKET_PATH` set, then polls the socket until ready.
+// This binary stays foreground-style and exits on Ctrl-C/shutdown signal.
 
+use clap::Parser;
+use cognitive_memory_core::{secure_private_file_if_exists, RuntimePaths};
 use cognitive_memory_daemon::{
-    paper_faithful_lifecycle_config, Daemon, DaemonConfig, LlmConfig,
+    paper_faithful_lifecycle_config, Daemon, DaemonConfig, DaemonRuntime, LlmConfig,
 };
 use cognitive_memory_embeddings::EmbeddingProvider;
 use cognitive_memory_lifecycle::LifecycleConfig;
@@ -19,34 +21,82 @@ use cognitive_memory_llm::LlmProvider;
 use cognitive_memory_store::Store;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing_subscriber::prelude::*;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "cm-daemon",
+    about = "Cognitive Memory resident daemon",
+    version
+)]
+struct Args {
+    /// Keep the daemon in the foreground. Accepted for symmetry with `cm daemon start`.
+    #[arg(long)]
+    foreground: bool,
+
+    /// Override runtime identity. Defaults to cognitive-memory in release and
+    /// cognitive-memory-dev in debug builds.
+    #[arg(long, env = "COGNITIVE_MEMORY_INSTANCE")]
+    instance: Option<String>,
+
+    /// Override Unix socket path.
+    #[arg(long, env = "COGNITIVE_MEMORY_SOCKET_PATH")]
+    socket: Option<PathBuf>,
+
+    /// Override SQLite database path.
+    #[arg(long, env = "COGNITIVE_MEMORY_DB_PATH")]
+    db: Option<PathBuf>,
+
+    /// Override PID file path.
+    #[arg(long, env = "COGNITIVE_MEMORY_PID_PATH")]
+    pid: Option<PathBuf>,
+
+    /// Override daemon log file path.
+    #[arg(long, env = "COGNITIVE_MEMORY_LOG_PATH")]
+    log: Option<PathBuf>,
+
+    /// Emit JSON logs.
+    #[arg(long, env = "COGNITIVE_MEMORY_LOG_JSON")]
+    json_logs: bool,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let args = Args::parse();
+    set_private_umask();
 
-    let socket_path = std::env::var("COGNITIVE_MEMORY_SOCKET_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::data_dir()
-                .expect("data dir resolvable")
-                .join("cognitive-memory")
-                .join("cm.sock")
-        });
-
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if let Some(instance) = &args.instance {
+        std::env::set_var("COGNITIVE_MEMORY_INSTANCE", instance);
     }
 
-    let db_path = socket_path
-        .parent()
-        .expect("socket path has parent")
-        .join("data.db");
-    let store = Store::open(&db_path).await?;
+    let mut paths = RuntimePaths::resolve();
+    if let Some(socket) = args.socket {
+        paths.socket_path = socket;
+    }
+    if let Some(db) = args.db {
+        paths.db_path = db;
+    }
+    if let Some(pid) = args.pid {
+        paths.pid_path = pid;
+    }
+    if let Some(log) = args.log {
+        paths.daemon_log_path = log;
+    }
+    paths.ensure_private_dirs()?;
+    if let Some(parent) = paths.socket_path.parent() {
+        cognitive_memory_core::ensure_private_dir(parent)?;
+    }
+    if let Some(parent) = paths.db_path.parent() {
+        cognitive_memory_core::ensure_private_dir(parent)?;
+    }
+    if let Some(parent) = paths.daemon_log_path.parent() {
+        cognitive_memory_core::ensure_private_dir(parent)?;
+    }
+
+    let _log_guard = init_logging(&paths, args.json_logs)?;
+
+    let store = Store::open(&paths.db_path).await?;
+    secure_private_file_if_exists(&paths.db_path)?;
 
     let embeddings = build_embeddings()?;
     tracing::info!(
@@ -78,7 +128,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let daemon = Daemon::new_full(store, embeddings, socket_path, llm, lifecycle);
+    let runtime = DaemonRuntime::from_paths(&paths);
+    let daemon = Daemon::new_full_runtime(store, embeddings, runtime, llm, lifecycle);
     let shutdown = daemon.shutdown_handle();
 
     tokio::spawn(async move {
@@ -91,8 +142,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn init_logging(
+    paths: &RuntimePaths,
+    json_logs: bool,
+) -> Result<tracing_appender::non_blocking::WorkerGuard, Box<dyn std::error::Error>> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.daemon_log_path)?;
+    secure_private_file_if_exists(&paths.daemon_log_path)?;
+    let appender = tracing_appender::rolling::never(&paths.log_dir, "daemon.log");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    let filter = tracing_subscriber::EnvFilter::try_from_env("COGNITIVE_MEMORY_LOG")
+        .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    if json_logs {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().json().with_writer(writer))
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(writer))
+            .init();
+    }
+    Ok(guard)
+}
+
+fn set_private_umask() {
+    #[cfg(unix)]
+    {
+        use nix::sys::stat::{umask, Mode};
+        let _ = umask(Mode::from_bits_truncate(0o077));
+    }
+}
+
 #[cfg(feature = "local-model")]
 fn build_embeddings() -> Result<Arc<dyn EmbeddingProvider>, Box<dyn std::error::Error>> {
+    if std::env::var("COGNITIVE_MEMORY_EMBEDDINGS")
+        .map(|v| v == "fake")
+        .unwrap_or(false)
+    {
+        use cognitive_memory_embeddings::FakeEmbeddingProvider;
+        return Ok(Arc::new(FakeEmbeddingProvider::new("local", "fake-16", 16)));
+    }
     use cognitive_memory_embeddings::LocalProvider;
     Ok(Arc::new(LocalProvider::bge_small_en()?))
 }

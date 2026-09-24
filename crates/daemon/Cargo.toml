@@ -50,6 +50,10 @@ tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
 sqlx = { workspace = true }
 dirs = { workspace = true }
+clap = { workspace = true }
+tracing-appender = { workspace = true }
+nix = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 cognitive-memory-client = { workspace = true }

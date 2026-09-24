@@ -45,16 +45,16 @@ print_stderr = "warn"
 
 [workspace.dependencies]
 # Internal crates.
-cognitive-memory-core = { path = "crates/core", version = "0.0.1" }
-cognitive-memory-protocol = { path = "crates/protocol", version = "0.0.1" }
-cognitive-memory-store = { path = "crates/store", version = "0.0.1" }
-cognitive-memory-search = { path = "crates/search", version = "0.0.1" }
-cognitive-memory-embeddings = { path = "crates/embeddings", version = "0.0.1" }
-cognitive-memory-llm = { path = "crates/llm", version = "0.0.1" }
-cognitive-memory-lifecycle = { path = "crates/lifecycle", version = "0.0.1" }
-cognitive-memory-graph = { path = "crates/graph", version = "0.0.1" }
-cognitive-memory-client = { path = "crates/client", version = "0.0.1" }
-cognitive-memory-daemon = { path = "crates/daemon", version = "0.0.1" }
+cognitive-memory-core = { path = "crates/core", version = "0.0.2" }
+cognitive-memory-protocol = { path = "crates/protocol", version = "0.0.2" }
+cognitive-memory-store = { path = "crates/store", version = "0.0.2" }
+cognitive-memory-search = { path = "crates/search", version = "0.0.2" }
+cognitive-memory-embeddings = { path = "crates/embeddings", version = "0.0.2" }
+cognitive-memory-llm = { path = "crates/llm", version = "0.0.2" }
+cognitive-memory-lifecycle = { path = "crates/lifecycle", version = "0.0.2" }
+cognitive-memory-graph = { path = "crates/graph", version = "0.0.2" }
+cognitive-memory-client = { path = "crates/client", version = "0.0.2" }
+cognitive-memory-daemon = { path = "crates/daemon", version = "0.0.2" }
 
 # Async runtime.
 tokio = { version = "1", features = ["full"] }
@@ -87,7 +87,7 @@ tracing-appender = "0.2"
 async-trait = "0.1"
 
 # Types.
-uuid = { version = "1", features = ["v7", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 ulid = { version = "1", features = ["serde"] }
 
@@ -99,7 +99,7 @@ dirs = "6"
 toml = "0.8"
 
 # Process control (signal-probe single-instance).
-nix = { version = "0.30", features = ["signal", "process"] }
+nix = { version = "0.30", features = ["signal", "process", "fs"] }
 
 # Hashing (cache keys, token hashes).
 sha2 = "0.10"

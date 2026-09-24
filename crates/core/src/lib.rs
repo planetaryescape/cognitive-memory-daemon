@@ -9,4 +9,9 @@
 //! bottom of.
 
 mod config;
+mod paths;
 pub use config::{config_path, ConfigError, DaemonConfig, LifecycleOverrides, LlmConfig};
+pub use paths::{
+    app_instance_name, default_instance_name, ensure_private_dir, secure_private_file_if_exists,
+    secure_private_socket, RuntimePaths,
+};

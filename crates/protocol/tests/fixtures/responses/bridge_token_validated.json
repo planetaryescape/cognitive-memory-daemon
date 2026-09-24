@@ -1,0 +1,15 @@
+{
+  "id": 23,
+  "payload": {
+    "kind": "Response",
+    "body": {
+      "ok": true,
+      "data": {
+        "kind": "BridgeTokenValidated",
+        "user_id": "alice",
+        "scope": "write",
+        "expires_at_unix": 1893456000
+      }
+    }
+  }
+}

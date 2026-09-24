@@ -1,0 +1,20 @@
+{
+  "id": 20,
+  "payload": {
+    "kind": "Response",
+    "body": {
+      "ok": true,
+      "data": {
+        "kind": "Doctor",
+        "exit_code": 1,
+        "checks": [
+          {
+            "name": "memories present",
+            "level": "warn",
+            "message": "store is empty"
+          }
+        ]
+      }
+    }
+  }
+}

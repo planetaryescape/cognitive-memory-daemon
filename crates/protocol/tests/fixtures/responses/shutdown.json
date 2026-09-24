@@ -1,0 +1,13 @@
+{
+  "id": 22,
+  "payload": {
+    "kind": "Response",
+    "body": {
+      "ok": true,
+      "data": {
+        "kind": "Shutdown",
+        "accepted": true
+      }
+    }
+  }
+}

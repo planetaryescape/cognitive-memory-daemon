@@ -150,28 +150,40 @@ async fn cm_no_spawn_fails_when_socket_missing() {
 }
 
 /// Auto-spawn: with no daemon running, `cm` forks `cm-daemon` and the
-/// command succeeds.
-///
-/// `#[ignore]` because the spawned `cm-daemon` runs with whatever Cargo
-/// features it was built with — by default that's `local-model`, which
-/// triggers a one-time bge-small-en-v1.5 download (~130 MB). Run
-/// manually with `cargo test --release -p cognitive-memory-cli
-/// cm_auto_spawns_daemon -- --ignored` once the model is cached.
+/// command succeeds. The test pins fake embeddings via env so CI never
+/// downloads the local model.
 #[tokio::test]
-#[ignore]
 async fn cm_auto_spawns_daemon_when_socket_missing() {
     let tmp = TempDir::new().unwrap();
     let socket = tmp.path().join("cm.sock");
     let daemon_bin = assert_cmd::cargo::cargo_bin("cm-daemon");
+    let tmp_path = tmp.path().to_path_buf();
 
     let socket_str = socket.to_str().unwrap().to_string();
     let daemon_bin_str = daemon_bin.to_str().unwrap().to_string();
+    let tmp_path_for_start = tmp_path.clone();
     let stdout = tokio::task::spawn_blocking(move || {
         let output = Command::cargo_bin("cm")
             .unwrap()
             .arg("--socket")
             .arg(&socket_str)
             .env("COGNITIVE_MEMORY_DAEMON_BIN", &daemon_bin_str)
+            .env("COGNITIVE_MEMORY_INSTANCE", "cm-cli-autospawn-test")
+            .env("COGNITIVE_MEMORY_EMBEDDINGS", "fake")
+            .env(
+                "COGNITIVE_MEMORY_CONFIG_DIR",
+                tmp_path_for_start.join("config"),
+            )
+            .env("COGNITIVE_MEMORY_DATA_DIR", tmp_path_for_start.join("data"))
+            .env(
+                "COGNITIVE_MEMORY_RUNTIME_DIR",
+                tmp_path_for_start.join("runtime"),
+            )
+            .env(
+                "COGNITIVE_MEMORY_CACHE_DIR",
+                tmp_path_for_start.join("cache"),
+            )
+            .env("COGNITIVE_MEMORY_LOG_DIR", tmp_path_for_start.join("logs"))
             .arg("status")
             .output()
             .unwrap();
@@ -187,12 +199,33 @@ async fn cm_auto_spawns_daemon_when_socket_missing() {
 
     assert!(stdout.contains("memories: 0"));
 
-    // The daemon binary uses local-model by default, which downloads
-    // bge-small. To keep CI fast, kill any spawned cm-daemon by removing
-    // the socket — its accept-loop will exit on next iteration.
-    if socket.exists() {
-        let _ = std::fs::remove_file(&socket);
-    }
+    let socket_for_stop = socket.to_str().unwrap().to_string();
+    let daemon_bin_stop = daemon_bin.to_str().unwrap().to_string();
+    tokio::task::spawn_blocking(move || {
+        let output = Command::cargo_bin("cm")
+            .unwrap()
+            .arg("--socket")
+            .arg(&socket_for_stop)
+            .env("COGNITIVE_MEMORY_DAEMON_BIN", &daemon_bin_stop)
+            .env("COGNITIVE_MEMORY_INSTANCE", "cm-cli-autospawn-test")
+            .env("COGNITIVE_MEMORY_EMBEDDINGS", "fake")
+            .env("COGNITIVE_MEMORY_CONFIG_DIR", tmp_path.join("config"))
+            .env("COGNITIVE_MEMORY_DATA_DIR", tmp_path.join("data"))
+            .env("COGNITIVE_MEMORY_RUNTIME_DIR", tmp_path.join("runtime"))
+            .env("COGNITIVE_MEMORY_CACHE_DIR", tmp_path.join("cache"))
+            .env("COGNITIVE_MEMORY_LOG_DIR", tmp_path.join("logs"))
+            .arg("daemon")
+            .arg("stop")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stop failed: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

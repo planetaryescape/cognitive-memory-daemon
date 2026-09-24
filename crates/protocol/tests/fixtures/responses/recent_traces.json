@@ -1,0 +1,25 @@
+{
+  "id": 21,
+  "payload": {
+    "kind": "Response",
+    "body": {
+      "ok": true,
+      "data": {
+        "kind": "RecentTraces",
+        "traces": [
+          {
+            "trace_id": "tr_01",
+            "request_id": 7,
+            "bucket": "Memory",
+            "op": "Search",
+            "embed_ms": null,
+            "vector_ms": null,
+            "fusion_ms": null,
+            "format_ms": null,
+            "elapsed_ms": 12.5
+          }
+        ]
+      }
+    }
+  }
+}

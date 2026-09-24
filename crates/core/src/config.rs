@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::RuntimePaths;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonConfig {
     #[serde(default)]
@@ -80,10 +82,7 @@ fn default_anthropic_model() -> String {
 
 /// Path to the user's daemon config file. Honours XDG via `dirs::config_dir`.
 pub fn config_path() -> PathBuf {
-    dirs::config_dir()
-        .expect("config dir resolvable")
-        .join("cognitive-memory")
-        .join("config.toml")
+    RuntimePaths::resolve().config_path
 }
 
 impl DaemonConfig {
@@ -108,10 +107,11 @@ impl DaemonConfig {
 
     pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(ConfigError::Io)?;
+            crate::ensure_private_dir(parent).map_err(ConfigError::Io)?;
         }
         let text = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
         std::fs::write(path, text).map_err(ConfigError::Io)?;
+        crate::secure_private_file_if_exists(path).map_err(ConfigError::Io)?;
         Ok(())
     }
 }
@@ -145,7 +145,8 @@ mod tests {
             [llm]
             provider = "none"
         "#;
-        let cfg: DaemonConfig = toml::from_str(toml_text).unwrap();
+        let cfg: DaemonConfig =
+            toml::from_str(toml_text).expect("config without lifecycle section parses");
         assert!(cfg.lifecycle.is_none());
     }
 
@@ -158,13 +159,14 @@ mod tests {
             [lifecycle.base_decay_rates]
             semantic = 60.0
         "#;
-        let cfg: DaemonConfig = toml::from_str(toml_text).unwrap();
+        let cfg: DaemonConfig =
+            toml::from_str(toml_text).expect("config with partial lifecycle override parses");
         let overrides = cfg.lifecycle.expect("lifecycle parsed");
         let rates = overrides.base_decay_rates.expect("rates parsed");
         assert_eq!(rates.get("semantic").copied(), Some(60.0));
         // No mention of episodic in the TOML ⇒ not present in the
         // override map (so it inherits paper default at merge time).
-        assert!(rates.get("episodic").is_none());
+        assert!(!rates.contains_key("episodic"));
     }
 
     #[test]
@@ -174,7 +176,8 @@ mod tests {
             episodic = 30.0
             semantic = 60.0
         "#;
-        let cfg: DaemonConfig = toml::from_str(toml_text).unwrap();
+        let cfg: DaemonConfig =
+            toml::from_str(toml_text).expect("config with multiple lifecycle overrides parses");
         let rates = cfg
             .lifecycle
             .expect("lifecycle parsed")
@@ -189,7 +192,7 @@ mod tests {
         // Operator hand-edits config.toml, daemon reloads on restart;
         // CLI's `set-llm` also rewrites the file. The roundtrip must
         // preserve [lifecycle] so set-llm doesn't clobber tuning state.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().expect("temporary config directory created");
         let path = tmp.path().join("config.toml");
         let mut original = DaemonConfig::default();
         let mut rates = HashMap::new();
@@ -198,8 +201,10 @@ mod tests {
             base_decay_rates: Some(rates),
         });
 
-        original.save_to(&path).unwrap();
-        let reloaded = DaemonConfig::load_from(&path).unwrap();
+        original
+            .save_to(&path)
+            .expect("config with lifecycle overrides saved");
+        let reloaded = DaemonConfig::load_from(&path).expect("saved config reloaded");
         let reloaded_rates = reloaded
             .lifecycle
             .expect("lifecycle survived roundtrip")

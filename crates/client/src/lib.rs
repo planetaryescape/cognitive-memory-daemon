@@ -15,6 +15,7 @@ use cognitive_memory_protocol::{
 };
 use futures::{SinkExt, StreamExt};
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
@@ -40,6 +41,8 @@ pub enum ClientError {
     IdMismatch { expected: u64, got: u64 },
     #[error("expected Response payload, got something else")]
     UnexpectedPayload(IpcPayload),
+    #[error("request timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 /// Client connected to a cognitive-memory daemon over a Unix socket.
@@ -84,6 +87,23 @@ impl Client {
 
     /// Send a request and await the matching response.
     pub async fn request(&mut self, request: Request) -> Result<Response, ClientError> {
+        self.request_with_timeout(request, Duration::from_secs(120))
+            .await
+    }
+
+    /// Send a request and await the matching response with an explicit timeout.
+    pub async fn request_with_timeout(
+        &mut self,
+        request: Request,
+        timeout: Duration,
+    ) -> Result<Response, ClientError> {
+        match tokio::time::timeout(timeout, self.request_inner(request)).await {
+            Ok(result) => result,
+            Err(_) => Err(ClientError::Timeout(timeout)),
+        }
+    }
+
+    async fn request_inner(&mut self, request: Request) -> Result<Response, ClientError> {
         let id = self.next_id;
         self.next_id = self.next_id.checked_add(1).expect("u64 id overflow");
 
@@ -93,21 +113,26 @@ impl Client {
         };
         self.framed.send(msg).await?;
 
-        let reply = self
-            .framed
-            .next()
-            .await
-            .ok_or(ClientError::UnexpectedClose)??;
+        loop {
+            let reply = self
+                .framed
+                .next()
+                .await
+                .ok_or(ClientError::UnexpectedClose)??;
 
-        if reply.id != id {
-            return Err(ClientError::IdMismatch {
-                expected: id,
-                got: reply.id,
-            });
-        }
-        match reply.payload {
-            IpcPayload::Response(resp) => Ok(resp),
-            other => Err(ClientError::UnexpectedPayload(other)),
+            if matches!(reply.payload, IpcPayload::Event(_)) {
+                continue;
+            }
+            if reply.id != id {
+                return Err(ClientError::IdMismatch {
+                    expected: id,
+                    got: reply.id,
+                });
+            }
+            match reply.payload {
+                IpcPayload::Response(resp) => return Ok(resp),
+                other => return Err(ClientError::UnexpectedPayload(other)),
+            }
         }
     }
 }

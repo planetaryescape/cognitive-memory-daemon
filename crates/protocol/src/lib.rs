@@ -186,11 +186,29 @@ pub struct ClearArgs {
 #[serde(tag = "op")]
 pub enum DiagnosticsRequest {
     Status,
+    /// Structured health report for operators and agents.
+    Doctor,
+    /// Return recent request traces from the daemon's bounded trace ring.
+    RecentTraces(RecentTracesArgs),
+    /// Ask the daemon to shut down gracefully.
+    Shutdown,
     /// Mint a bearer token for `cm-http` use. The daemon stores a salted
     /// hash; the raw token is returned once and not recoverable.
     MintBridgeToken(MintBridgeTokenArgs),
+    /// Validate a bridge bearer token against daemon-owned token storage.
+    ValidateBridgeToken(ValidateBridgeTokenArgs),
     /// Per-user tier counts (hot/cold/stub/total).
     Counts(CountsArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentTracesArgs {
+    #[serde(default = "default_trace_limit")]
+    pub limit: usize,
+}
+
+fn default_trace_limit() -> usize {
+    20
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +224,12 @@ pub struct MintBridgeTokenArgs {
     pub scope: BridgeScope,
     #[serde(default = "default_ttl")]
     pub ttl_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidateBridgeTokenArgs {
+    pub token: String,
+    pub required_scope: BridgeScope,
 }
 
 fn default_ttl() -> u64 {
@@ -227,6 +251,9 @@ pub enum BridgeScope {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op")]
 pub enum MemoryRequest {
+    /// Subscribe this connection to daemon events. Events are delivered as
+    /// `IpcPayload::Event` frames with `id = 0` until the connection closes.
+    Subscribe(SubscribeArgs),
     Store(StoreMemoryArgs),
     /// Store many memories in one call. Memories created together get
     /// bidirectional associations between every pair (paper §3.6:
@@ -252,6 +279,13 @@ pub enum MemoryRequest {
     /// `Search`.
     SearchLexical(SearchLexicalArgs),
     BatchUpdate(BatchUpdateArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SubscribeArgs {
+    /// Send a current-state event immediately after subscription succeeds.
+    #[serde(default = "default_true")]
+    pub replay_snapshot: bool,
 }
 
 /// One memory's worth of args for `Memory::Store` and items in
@@ -542,6 +576,11 @@ impl Response {
 #[serde(tag = "kind")]
 pub enum ResponseData {
     Status(StatusData),
+    Doctor(DoctorData),
+    RecentTraces(RecentTracesData),
+    Shutdown(ShutdownData),
+    Subscribed(SubscribedData),
+    BridgeTokenValidated(BridgeTokenValidatedData),
     MemoryStored(MemoryStoredData),
     MemoryStoredBatch(MemoryStoredBatchData),
     MemorySearchResults(MemorySearchResultsData),
@@ -554,6 +593,62 @@ pub enum ResponseData {
     LinkStrength(LinkStrengthData),
     LexicalIds(LexicalIdsData),
     Tick(TickResultData),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorData {
+    pub exit_code: i32,
+    pub checks: Vec<DoctorCheckData>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorCheckData {
+    pub name: String,
+    pub level: DoctorCheckLevel,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DoctorCheckLevel {
+    Ok,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecentTracesData {
+    pub traces: Vec<TraceData>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceData {
+    pub trace_id: String,
+    pub request_id: u64,
+    pub bucket: String,
+    pub op: String,
+    pub embed_ms: Option<f64>,
+    pub vector_ms: Option<f64>,
+    pub fusion_ms: Option<f64>,
+    pub format_ms: Option<f64>,
+    pub elapsed_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShutdownData {
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscribedData {
+    pub replay_snapshot_sent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeTokenValidatedData {
+    pub user_id: String,
+    pub scope: BridgeScope,
+    pub expires_at_unix: i64,
 }
 
 /// Outcome of `Memory::StoreBatch` — the assigned ids in the order they
@@ -688,6 +783,22 @@ pub struct SearchHit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusData {
     pub daemon_version: String,
+    #[serde(default)]
+    pub protocol_version: u32,
+    #[serde(default)]
+    pub build_id: String,
+    #[serde(default)]
+    pub instance: String,
+    #[serde(default)]
+    pub daemon_pid: u32,
+    #[serde(default)]
+    pub socket_path: String,
+    #[serde(default)]
+    pub pid_path: String,
+    #[serde(default)]
+    pub db_path: String,
+    #[serde(default)]
+    pub log_path: String,
     pub uptime_seconds: u64,
     pub memory_count: u64,
 }
@@ -700,8 +811,8 @@ pub struct ResponseError {
     pub retriable: bool,
 }
 
-/// Closed enum of error kinds. Adding a kind is additive (clients ignore
-/// unknown kinds via `Other`).
+/// Closed enum of error kinds. Adding a kind is additive for protocol v1
+/// clients that deserialize through a forward-compatible mirror.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResponseErrorKind {
     ProtocolMismatch,
@@ -722,6 +833,11 @@ pub enum ResponseErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum Event {
+    /// Snapshot emitted immediately after `Memory::Subscribe` when requested.
+    CurrentState {
+        memory_count: u64,
+        occurred_at: String,
+    },
     /// Periodic maintenance pass completed. Phase 0 includes this as a
     /// minimal Event variant; lifecycle/memory events land in later phases.
     TickCompleted {
@@ -729,4 +845,6 @@ pub enum Event {
         consolidations_attempted: u64,
         occurred_at: String,
     },
+    /// A subscribed client fell behind the event channel.
+    EventStreamLagged { skipped: u64, occurred_at: String },
 }

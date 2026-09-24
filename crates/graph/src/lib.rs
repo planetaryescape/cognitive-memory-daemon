@@ -4,10 +4,8 @@
 //! `cognitive-memory-sdk/sdks/python/src/cognitive_memory/engine.py`
 //! (`strengthen_association`, `decay_association`, `_expand_graph`).
 //!
-//! Phase 9 ships the math (strengthen, decay, BFS); the integration with
-//! `Memory::Search { graph_expansion: { enabled: true } }` lands when the
-//! daemon's search request grows that field. For now the lifecycle and
-//! search crates compose these helpers when their callers ask for it.
+//! The search path composes these helpers when callers request graph
+//! expansion or bridge discovery.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 

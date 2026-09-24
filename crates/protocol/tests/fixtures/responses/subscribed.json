@@ -1,0 +1,13 @@
+{
+  "id": 24,
+  "payload": {
+    "kind": "Response",
+    "body": {
+      "ok": true,
+      "data": {
+        "kind": "Subscribed",
+        "replay_snapshot_sent": true
+      }
+    }
+  }
+}

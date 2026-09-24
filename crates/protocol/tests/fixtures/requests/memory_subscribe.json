@@ -1,0 +1,11 @@
+{
+  "id": 24,
+  "payload": {
+    "kind": "Request",
+    "body": {
+      "bucket": "Memory",
+      "op": "Subscribe",
+      "replay_snapshot": true
+    }
+  }
+}

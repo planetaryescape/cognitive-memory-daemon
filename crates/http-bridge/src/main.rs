@@ -5,10 +5,11 @@
 // request requires `Authorization: Bearer <token>`.
 
 use anyhow::Context;
+use axum::http::HeaderValue;
+use cognitive_memory_core::{secure_private_file_if_exists, RuntimePaths};
 use cognitive_memory_http_bridge::{enforce_loopback, router, AppState, Scope, TokenStore};
 use std::env;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::str::FromStr;
 
 #[tokio::main]
@@ -26,14 +27,8 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("parse bind address {bind_str}"))?;
     let addr = enforce_loopback(addr)?;
 
-    let socket_path = env::var("COGNITIVE_MEMORY_SOCKET_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::data_dir()
-                .expect("data dir")
-                .join("cognitive-memory")
-                .join("cm.sock")
-        });
+    let paths = RuntimePaths::resolve();
+    let socket_path = paths.socket_path.clone();
 
     let salt = env::var("COGNITIVE_MEMORY_HTTP_SALT")
         .unwrap_or_else(|_| "cm-http-default-salt-change-me".to_string());
@@ -45,8 +40,8 @@ async fn main() -> anyhow::Result<()> {
     // 1. Daemon-minted (preferred). When `COGNITIVE_MEMORY_HTTP_MINT_USER`
     //    is set, the bridge connects to the daemon, calls
     //    `Diagnostics::MintBridgeToken`, registers the returned token
-    //    locally, and prints the raw token to logs once. The daemon stores
-    //    only a salted hash.
+    //    locally, and writes the raw token to a private token file once.
+    //    The daemon stores only a salted hash.
     //
     // 2. Env bootstrap (fallback). When `COGNITIVE_MEMORY_HTTP_BOOTSTRAP_TOKEN`
     //    is set, the bridge accepts that pre-shared token. Useful for
@@ -83,9 +78,10 @@ async fn main() -> anyhow::Result<()> {
                     expires_at_unix = t.expires_at_unix,
                     "bridge token minted from daemon"
                 );
+                write_startup_token_file(&paths, &mint_user, scope, &t.token, t.expires_at_unix)?;
                 tracing::info!(
-                    token = %t.token,
-                    "BRIDGE TOKEN — store this; it will not be shown again"
+                    path = %paths.bridge_token_path.display(),
+                    "bridge token written to private token file"
                 );
                 tokens.mint(t.token.as_bytes(), mint_user, scope);
             }
@@ -103,6 +99,8 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         socket_path,
         tokens,
+        allowed_hosts: parse_csv_env("COGNITIVE_MEMORY_HTTP_ALLOWED_HOSTS"),
+        allowed_origins: parse_origin_env()?,
     };
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -112,10 +110,69 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn parse_csv_env(name: &str) -> Vec<String> {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_origin_env() -> anyhow::Result<Vec<HeaderValue>> {
+    let origins = parse_csv_env("COGNITIVE_MEMORY_HTTP_ALLOWED_ORIGINS");
+    let origins = if origins.is_empty() {
+        parse_csv_env("COGNITIVE_MEMORY_HTTP_CORS_ORIGINS")
+    } else {
+        origins
+    };
+    origins
+        .into_iter()
+        .map(|origin| {
+            HeaderValue::from_str(&origin)
+                .with_context(|| format!("invalid HTTP bridge origin: {origin}"))
+        })
+        .collect()
+}
+
 fn parse_scope(s: &str) -> Scope {
     match s {
         "read" => Scope::Read,
         "admin" => Scope::Admin,
         _ => Scope::Write,
     }
+}
+
+fn write_startup_token_file(
+    paths: &RuntimePaths,
+    user_id: &str,
+    scope: Scope,
+    token: &str,
+    expires_at_unix: i64,
+) -> anyhow::Result<()> {
+    if let Some(parent) = paths.bridge_token_path.parent() {
+        cognitive_memory_core::ensure_private_dir(parent)?;
+    }
+    let scope = match scope {
+        Scope::Read => "read",
+        Scope::Write => "write",
+        Scope::Admin => "admin",
+    };
+    let payload = serde_json::json!({
+        "user_id": user_id,
+        "scope": scope,
+        "token": token,
+        "expires_at_unix": expires_at_unix
+    });
+    std::fs::write(
+        &paths.bridge_token_path,
+        serde_json::to_vec_pretty(&payload)?,
+    )?;
+    secure_private_file_if_exists(&paths.bridge_token_path)?;
+    Ok(())
 }
